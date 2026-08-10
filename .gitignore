@@ -2,16 +2,23 @@
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
 
 # 环境配置
 .env
+
+# 本地配置（可能含敏感信息，如 MCP Server 的 token）
+config.json
 
 # 输出报告
 output/
 reports/
 
 # Chroma 向量库（自动生成）
-research_agent/rag/rag_db/
+src/minimate/rag/rag_db/
 
 # 旧版 Chroma（清理前残留）
 chroma_db/
+
+# 旧版 research_agent 目录（MiniMate 迁移前的遗留，暂不纳入）
+research_agent/

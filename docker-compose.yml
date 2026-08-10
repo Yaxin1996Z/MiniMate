@@ -1,17 +1,17 @@
 # ============================================================
-# ResearchAgent — Docker Compose 部署
+# MiniMate — Docker Compose 部署
 # 用法：
 #   docker compose build            # 构建镜像
 #   docker compose up -d            # 启动服务
-#   docker compose exec research-agent python -m research_agent.main --rebuild  # 重建知识库
+#   docker compose exec minimate minimate --rebuild  # 重建知识库
 #   docker compose logs -f          # 查看日志
 #   docker compose down             # 停止
 # ============================================================
 
 services:
-  research-agent:
+  minimate:
     build: .
-    container_name: research-agent
+    container_name: minimate
     ports:
       - "8000:8000"
     env_file:
@@ -19,16 +19,16 @@ services:
     volumes:
       - ./output:/app/output
       # 知识库持久化（首次需 exec --rebuild 建索引）
-      - rag_data:/app/research_agent/rag/rag_db
-      # 知识库文档目录（放书的地方）
-      - ./research_agent/rag/repo:/app/research_agent/rag/repo
+      - rag_data:/app/src/minimate/rag/rag_db
+      # 知识库文档目录
+      - ./src/minimate/rag/repo:/app/src/minimate/rag/repo
       # bge 模型缓存（避免容器内下载）
       - C:/Users/ZhangYaxin/.cache:/root/.cache
     environment:
       - TZ=Asia/Shanghai
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import research_agent; print('ok')"]
+      test: ["CMD", "python", "-c", "import minimate; print('ok')"]
       interval: 30s
       timeout: 10s
       retries: 3

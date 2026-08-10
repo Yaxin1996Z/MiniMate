@@ -76,6 +76,16 @@ class KnowledgeBase:
 
         type(self)._current_repo = self._repo_dir
 
+        # 快速路径：repo 目录无文档时不加载 embedding 模型与 Chroma，
+        # 避免空知识库场景下每次启动都要等待模型加载（几十秒）
+        self._embed_func = None
+        self._client = None
+        self._collection = None
+        self._doc_count = 0
+        if not glob.glob(os.path.join(self._repo_dir, "*.md")) and \
+           not glob.glob(os.path.join(self._repo_dir, "*.txt")):
+            return
+
         self._embed_func = SentenceTransformerEmbeddingFunction(model_name=embed_path)
 
         # 初始化 Chroma
@@ -198,6 +208,11 @@ class KnowledgeBase:
 
     def rebuild(self):
         """强制重建索引：清空数据库，重新加载 repo 目录"""
+        # 之前以空库初始化（未加载引擎），现在有文档了，重新完整初始化
+        if self._client is None:
+            self._initialized = False
+            self.__init__(self._repo_dir)
+            return
         self._client.delete_collection("research_knowledge")
         self._collection = self._client.get_or_create_collection(
             name="research_knowledge",

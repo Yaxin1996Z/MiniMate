@@ -1,13 +1,15 @@
 [project]
-name = "research-agent"
-version = "1.0.0"
-description = "多Agent研究助理系统 - Multi-Agent Research Assistant"
+name = "minimate"
+version = "0.1.0"
+description = "MiniMate - 工作/代码助手 Agent（支持 chat / react / plan 三种模式）"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "chromadb>=1.5.9",
     "duckduckgo-search>=8.1.1",
     "fastapi>=0.136.3",
+    "fastmcp>=2.14.1",
+    "mcp>=1.0,<2",
     "openai>=1.90.0",
     "python-dotenv>=1.1.0",
     "sentence-transformers",
@@ -15,4 +17,16 @@ dependencies = [
 ]
 
 [project.scripts]
-research-agent = "research_agent.main:cli"
+minimate = "cli:main"
+minimate-server = "api:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["cli", "api"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

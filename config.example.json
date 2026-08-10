@@ -1,0 +1,12 @@
+{
+  "mcp": {
+    "servers": [
+      {
+        "name": "demo",
+        "command": "uv",
+        "args": ["run", "python", "examples/mcp_demo_server.py"],
+        "env": {}
+      }
+    ]
+  }
+}
