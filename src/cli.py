@@ -37,6 +37,7 @@ from minimate.rag import get_knowledge_base
 from minimate.colors import color
 from minimate.config import get_mcp_servers
 from minimate.mcp import McpToolAdapter
+from minimate.logging import log_path
 
 
 # 保持 MCP 连接引用，防止被 GC 回收
@@ -60,6 +61,7 @@ def _load_mcp_tools(tools: ToolExecutor):
                 env=server.get("env"),
                 url=server.get("url"),
                 headers=server.get("headers"),
+                oauth=server.get("oauth"),
             )
             mcp_tools = adapter.connect()
             for t in mcp_tools:
@@ -283,6 +285,8 @@ def cli():
     parser.add_argument("--version", "-v", action="store_true", help="显示版本")
 
     args = parser.parse_args()
+
+    print(f"  日志：{log_path()}")
 
     if args.version:
         print(f"MiniMate v{__version__}")

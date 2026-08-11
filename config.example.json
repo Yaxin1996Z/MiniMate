@@ -9,11 +9,13 @@
         "env": {}
       },
       {
-        "name": "remote",
+        "name": "notion",
         "transport": "http",
-        "url": "http://localhost:9000/mcp",
-        "headers": {
-          "Authorization": "Bearer your-token-here"
+        "url": "https://mcp.notion.com/mcp",
+        "headers": {},
+        "oauth": {
+          "client_id": "YOUR_NOTION_OAUTH_CLIENT_ID",
+          "scope": "openid offline_access"
         }
       }
     ]

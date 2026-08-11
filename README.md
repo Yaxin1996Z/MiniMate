@@ -180,10 +180,10 @@ cp config.example.json config.json
         "env": {}
       },
       {
-        "name": "remote",
+        "name": "notion",
         "transport": "http",
-        "url": "http://127.0.0.1:9100/mcp",
-        "headers": { "Authorization": "Bearer xxx" }
+        "url": "https://mcp.notion.com/mcp",
+        "headers": {}
       }
     ]
   }
@@ -198,7 +198,7 @@ cp config.example.json config.json
 > /mcp
   MCP 服务器状态：
     ✅ demo [stdio] connected · 3 个工具
-    ✅ remote [http] connected · 2 个工具
+    ✅ notion [http] connected · N 个工具
 ```
 
 示例 Server：`examples/mcp_demo_server.py`（stdio，add/multiply/current_time）、`examples/mcp_http_server.py`（http，greeting/reverse）。
@@ -228,7 +228,8 @@ MiniMate/
 │       ├── mcp/                  # MCP 包（stdio + http 双传输）
 │       │   ├── adapter.py        # McpToolAdapter：统一适配器 + 连接状态机
 │       │   ├── stdio.py          # stdio 传输（本地子进程）
-│       │   └── http.py           # Streamable HTTP 传输（远程 URL）
+│       │   ├── http.py           # Streamable HTTP 传输（远程 URL）
+│       │   └── oauth.py          # OAuth 2.0（授权码 PKCE / 设备流 / 动态注册）
 │       └── rag/                  # RAG 知识库（Chroma + bge）
 │           ├── __init__.py
 │           ├── config.toml       # 模型路径、目录配置

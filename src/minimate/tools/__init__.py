@@ -9,7 +9,7 @@
   registry.py    - 注册中心（register_all_tools）
 """
 
-from .core import Tool, ToolExecutor, parse_react, tool, truncate
+from .core import Tool, ToolExecutor, classify_error, parse_react, tool, truncate
 from .file_tools import (
     find_files,
     grep_files,
@@ -27,6 +27,7 @@ __all__ = [
     "Tool",
     "ToolExecutor",
     "tool",
+    "classify_error",
     "parse_react",
     "truncate",
     "read_file",

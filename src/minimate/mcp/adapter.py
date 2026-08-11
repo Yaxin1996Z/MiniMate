@@ -17,6 +17,7 @@ from datetime import datetime
 from mcp import ClientSession
 
 from ..tools import Tool
+from ..logging import logger
 from .stdio import create_client_ctx as _stdio_ctx
 from .http import create_client_ctx as _http_ctx
 
@@ -43,6 +44,7 @@ class McpToolAdapter:
         env: dict | None = None,
         url: str | None = None,
         headers: dict | None = None,
+        oauth: dict | None = None,
     ):
         self.server_name = server_name
         self.transport = transport
@@ -52,6 +54,7 @@ class McpToolAdapter:
             "env": env,
             "url": url,
             "headers": headers,
+            "oauth": oauth,
         }
         # 连接状态
         self.status = McpStatus.PENDING
@@ -88,9 +91,17 @@ class McpToolAdapter:
             self.status = McpStatus.CONNECTED
             self.tool_count = len(self._tools)
             self.connected_at = datetime.now().strftime("%H:%M:%S")
+            logger.info(
+                "MCP 连接成功 server=%s transport=%s tools=%d",
+                self.server_name, self.transport, self.tool_count,
+            )
         except Exception as e:
             self.status = McpStatus.FAILED
             self.error = str(e)
+            logger.error(
+                "MCP 连接失败 server=%s transport=%s error=%s",
+                self.server_name, self.transport, e,
+            )
             # 清理失败时启动的事件循环线程
             if self._loop is not None:
                 try:

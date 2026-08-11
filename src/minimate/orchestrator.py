@@ -16,6 +16,7 @@ from . import llm
 from .tools import ToolExecutor, parse_react, truncate
 from .memory import ResearchMemory
 from .colors import color
+from .logging import logger
 
 
 # ============================================================
@@ -89,7 +90,7 @@ class Agent:
         """纯问答：只调用一次 LLM 就返回答案"""
         system = self.build_system_prompt(include_tools=False)
         user_msg = self._build_user_message(task, context)
-        print(_section("用户输入", user_msg, fg="blue"))
+        print(_section("用户输入", self._display_user_input(task, context), fg="blue"))
         print(_section("助手思考", f"单次调用 LLM，直接作答（{self.role}）", fg="yellow"))
         result = llm.call(user_msg, system)
         print(_section("助手回答", result, fg="green"))
@@ -99,7 +100,7 @@ class Agent:
         """ReAct 循环：Thought → Action → Observation → Final Answer"""
         system = self.build_system_prompt()
         user_msg = self._build_user_message(task, context)
-        print(_section("用户输入", user_msg, fg="blue"))
+        print(_section("用户输入", self._display_user_input(task, context), fg="blue"))
 
         # 无工具：退化为单次调用
         if not self.tools or not self.tools.tool_list:
@@ -112,6 +113,7 @@ class Agent:
         print(_section("助手思考", f"进入 ReAct 循环，最多 {self.max_steps} 步", fg="yellow"))
 
         # 双通道：优先 Function Calling，异常时降级到文本协议
+        recent_calls: list[tuple[str, str]] = []  # (工具名, 归一化参数)，用于重复调用检测
         try:
             # FC 通道：system 不含文本协议格式说明，避免模型输出 Final Answer 前缀
             fc_system = self.build_system_prompt(include_tools=True, include_protocol=False)
@@ -119,16 +121,17 @@ class Agent:
             if fc_system:
                 messages_fc.append({"role": "system", "content": fc_system})
             messages_fc.append({"role": "user", "content": user_msg})
-            return self._run_react_fc(messages_fc)
+            return self._run_react_fc(messages_fc, recent_calls)
         except Exception as e:
+            logger.warning("Function Calling 降级到文本协议：%s", e)
             print(_section("助手思考", f"Function Calling 不可用（{e}），降级到文本协议", fg="yellow"))
             messages_text = []
             if system:
                 messages_text.append({"role": "system", "content": system})
             messages_text.append({"role": "user", "content": user_msg})
-            return self._run_react_text(messages_text)
+            return self._run_react_text(messages_text, recent_calls)
 
-    def _run_react_fc(self, messages: list[dict]) -> str:
+    def _run_react_fc(self, messages: list[dict], recent_calls: list[tuple[str, str]]) -> str:
         """Function Calling 通道：模型原生输出 tool_calls，零正则解析"""
         schemas = self.tools.schemas
         print(_section("助手思考", f"Function Calling 通道（{len(schemas)} 个工具）", fg="yellow"))
@@ -150,7 +153,11 @@ class Agent:
                         f"工具：{name}\n参数：{json.dumps(args, ensure_ascii=False)}",
                         fg="cyan",
                     ))
-                    observation = self.tools.execute(name, **args)
+                    repeat_hint = self._check_repeat(name, args, recent_calls)
+                    if repeat_hint:
+                        observation = repeat_hint
+                    else:
+                        observation = self.tools.execute(name, **args)
                     print(_section("工具返回", truncate(observation, 1000), fg="magenta"))
 
                     # 消息回填：assistant 必须带原始 tool_calls，结果以 tool 角色返回
@@ -182,9 +189,10 @@ class Agent:
             f"（达到最大步数 {self.max_steps}，返回最后输出）\n{last_content or '(无输出)'}",
             fg="green",
         ))
+        logger.warning("ReAct 达到最大步数 %d 未完成（FC 通道）", self.max_steps)
         return last_content
 
-    def _run_react_text(self, messages: list[dict]) -> str:
+    def _run_react_text(self, messages: list[dict], recent_calls: list[tuple[str, str]]) -> str:
         """文本协议通道（fallback）：Thought/Action/Observation + 正则解析"""
         last_output = ""
         for step in range(1, self.max_steps + 1):
@@ -204,9 +212,15 @@ class Agent:
                 if parsed["action_input"]:
                     action_info += f"\n参数：{parsed['action_input']}"
                 print(_section("工具调用", action_info, fg="cyan"))
-                observation = self.tools.execute_text(
-                    parsed["action"], parsed["action_input"]
+                repeat_hint = self._check_repeat(
+                    parsed["action"], parsed["action_input"], recent_calls
                 )
+                if repeat_hint:
+                    observation = repeat_hint
+                else:
+                    observation = self.tools.execute_text(
+                        parsed["action"], parsed["action_input"]
+                    )
                 print(_section("工具返回", truncate(observation, 1000), fg="magenta"))
                 messages.append({"role": "assistant", "content": last_output})
                 messages.append(
@@ -228,6 +242,7 @@ class Agent:
             f"（达到最大步数 {self.max_steps}，返回最后输出）\n{last_output.strip()}",
             fg="green",
         ))
+        logger.warning("ReAct 达到最大步数 %d 未完成（文本协议）", self.max_steps)
         final = parse_react(last_output)["final_answer"]
         return (final or last_output).strip()
 
@@ -243,6 +258,7 @@ class Agent:
         # 1) 生成计划（结构化 JSON）
         plan = self._make_plan(task, context)
         if not plan:
+            logger.info("Plan&Execute 计划解析失败，回退到 ReAct：%s", task[:80])
             print(_section("助手思考", "计划解析失败，回退到 ReAct", fg="yellow"))
             return self._run_react(task, context)
 
@@ -324,6 +340,52 @@ class Agent:
             if mem_ctx:
                 user_msg = f"{mem_ctx}\n\n{user_msg}"
         return user_msg
+
+    def _display_user_input(self, task: str, context: str = "") -> str:
+        """观测显示用：只展示当前任务，上下文/记忆用摘要代替，避免刷屏
+
+        注意：这只是观测层展示，发送给 LLM 的完整上下文不受影响。
+        """
+        text = f"当前任务：{task}"
+        if context:
+            text += f"\n（参考上下文 {len(context)} 字符，未展开显示）"
+        if self.memory and self.memory.get_context():
+            text += "\n（携带会话记忆，未展开显示）"
+        return text
+
+    def _check_repeat(
+        self,
+        tool_name: str,
+        args: dict | str,
+        recent_calls: list[tuple[str, str]],
+    ) -> str | None:
+        """重复调用检测：相同 (工具, 参数) 连续尝试 >= 2 次时返回提示并阻止执行
+
+        args 支持 dict（FC 通道）或字符串（文本协议通道）。
+        命中时返回提示文本（作为 Observation 回灌给模型），未命中返回 None。
+        """
+        if isinstance(args, dict):
+            key = (tool_name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+        else:
+            key = (tool_name, str(args or "").strip())
+        recent_calls.append(key)
+
+        count = 0
+        for k in reversed(recent_calls):
+            if k == key:
+                count += 1
+            else:
+                break
+        if count >= 2:
+            logger.warning(
+                "重复调用拦截 tool=%s args=%s count=%d",
+                tool_name, key[1][:120], count,
+            )
+            return (
+                f"[重复调用] 工具 {tool_name} 使用相同参数已连续尝试 {count} 次未成功。"
+                "请勿重复此调用，改用其他参数或工具，或直接向用户说明无法完成。"
+            )
+        return None
 
 
 # ============================================================

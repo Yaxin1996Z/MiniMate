@@ -10,7 +10,10 @@ import re
 import json
 import os
 import inspect
-from typing import Any, Callable
+import time
+from typing import Any, Callable, Literal
+
+from ..logging import audit_tool_call
 
 
 # ============================================================
@@ -40,9 +43,9 @@ class Tool:
         """按命名参数执行（Function Calling 通道）"""
         try:
             result = self.func(**kwargs)
-            return str(result)
+            return classify_error(str(result))
         except Exception as e:
-            return f"[工具错误] {e}"
+            return classify_error(f"[工具错误] {e}")
 
     def run_text(self, text: str) -> str:
         """按文本协议执行（fallback 通道）：单参数取整段，多参数按 | 拆分"""
@@ -69,7 +72,14 @@ class Tool:
 
 
 def _infer_parameters(func: Callable) -> dict:
-    """从函数签名自动推断 JSON Schema 参数定义"""
+    """从函数签名自动推断 JSON Schema 参数定义
+
+    支持：
+      - 类型注解（str/int/float/bool）→ JSON 类型
+      - typing.Literal[...] → enum 限制取值范围
+      - 默认值 → required 排除 + default 记录
+      - additionalProperties: false → 禁止模型传 Schema 外的脏字段
+    """
     sig = inspect.signature(func)
     props: dict[str, dict] = {}
     required: list[str] = []
@@ -81,17 +91,34 @@ def _infer_parameters(func: Callable) -> dict:
             inspect.Parameter.KEYWORD_ONLY,
         ):
             continue
+
         ptype = "string"
-        if param.annotation is not inspect.Parameter.empty:
+        annotation = param.annotation
+        enum_values = None
+
+        # typing.Literal[...] → enum 限制取值
+        if getattr(annotation, "__origin__", None) is Literal:
+            enum_values = list(annotation.__args__)
+            if enum_values:
+                ptype = type_map.get(type(enum_values[0]), "string")
+        elif annotation is not inspect.Parameter.empty:
             ptype = type_map.get(param.annotation, "string")
+
         prop: dict = {"type": ptype}
+        if enum_values is not None:
+            prop["enum"] = enum_values
         if param.default is not inspect.Parameter.empty:
             prop["default"] = param.default
         else:
             required.append(pname)
         props[pname] = prop
 
-    return {"type": "object", "properties": props, "required": required}
+    return {
+        "type": "object",
+        "properties": props,
+        "required": required,
+        "additionalProperties": False,
+    }
 
 
 def tool(name: str = "", description: str = ""):
@@ -193,19 +220,37 @@ class ToolExecutor:
 
     def execute(self, tool_name: str, **kwargs) -> str:
         """按命名参数执行（Function Calling 通道）"""
+        start = time.time()
         tool = self._tools.get(tool_name)
         if not tool:
             available = ", ".join(self._tools) if self._tools else "无"
-            return f"[工具错误] 未知工具 '{tool_name}'，可用工具：{available}"
-        return tool.run_kwargs(kwargs)
+            result = classify_error(f"[工具错误] 未知工具 '{tool_name}'，可用工具：{available}")
+        else:
+            result = tool.run_kwargs(kwargs)
+        audit_tool_call(
+            tool_name,
+            json.dumps(kwargs, ensure_ascii=False)[:200],
+            result,
+            time.time() - start,
+        )
+        return result
 
     def execute_text(self, tool_name: str, text: str = "") -> str:
         """按文本协议执行（fallback 通道）"""
+        start = time.time()
         tool = self._tools.get(tool_name)
         if not tool:
             available = ", ".join(self._tools) if self._tools else "无"
-            return f"[工具错误] 未知工具 '{tool_name}'，可用工具：{available}"
-        return tool.run_text(text)
+            result = classify_error(f"[工具错误] 未知工具 '{tool_name}'，可用工具：{available}")
+        else:
+            result = tool.run_text(text)
+        audit_tool_call(
+            tool_name,
+            text[:200],
+            result,
+            time.time() - start,
+        )
+        return result
 
     def execute_action(self, tool_name: str, args: str = "") -> str:
         """按工具名执行文本参数（旧接口，兼容）"""
@@ -293,3 +338,42 @@ def truncate(text: str, max_chars: int = 3000) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + f"\n...[结果过长，已截断 {len(text) - max_chars} 字符]"
+
+
+# ============================================================
+# 错误分级标记
+# ============================================================
+
+_RETRYABLE_KEYWORDS = (
+    "超时", "timeout", "网络", "连接", "暂时", "稍后",
+    "busy", "rate", "限流", "搜索出错",
+)
+_NON_RETRYABLE_KEYWORDS = (
+    "不存在", "不是目录", "未知工具", "参数", "格式",
+    "需要", "无效", "拒绝", "请提供", "未找到",
+    "不能为空", "错误：",
+)
+_ERROR_PREFIXES = (
+    "错误", "[工具错误]", "[MCP 工具错误]", "[命令",
+    "[搜索出错]", "[读文件错误]", "[写文件错误]",
+    "[列目录错误]", "[搜索错误]",
+)
+
+
+def classify_error(text: str) -> str:
+    """给工具错误附加可恢复性标记：[可重试] / [不可重试]
+
+    - 已带标记（幂等）或不是错误文本 → 原样返回
+    - 命中可重试关键词（超时/网络/临时） → [可重试]
+    - 其他错误默认 [不可重试]（参数/确定性问题不重试）
+    """
+    text = text or ""
+    if "[可重试]" in text or "[不可重试]" in text:
+        return text
+    if not text.startswith(_ERROR_PREFIXES):
+        return text
+    if any(k in text for k in _RETRYABLE_KEYWORDS):
+        return f"[可重试] {text}"
+    if any(k in text for k in _NON_RETRYABLE_KEYWORDS):
+        return f"[不可重试] {text}"
+    return f"[不可重试] {text}"

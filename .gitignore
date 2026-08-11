@@ -17,6 +17,12 @@ reports/
 # Chroma 向量库（自动生成）
 src/minimate/rag/rag_db/
 
+# 日志
+logs/
+
+# 本地缓存（OAuth token 等）
+.cache/
+
 # 旧版 Chroma（清理前残留）
 chroma_db/
 

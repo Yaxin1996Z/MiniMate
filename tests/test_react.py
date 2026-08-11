@@ -150,6 +150,26 @@ class AgentReactLoopTest(unittest.TestCase):
         result = agent.run("测试任务")
         self.assertEqual(result, "这是一段直接回答")
 
+    @patch("minimate.orchestrator.llm.chat_tools")
+    def test_repeat_call_detected(self, mock_chat_tools):
+        """相同工具相同参数连续调用 → 第二次起不执行，回灌重复提示"""
+        calls = [self._fc_call()]
+        mock_chat_tools.side_effect = [
+            {"content": "", "tool_calls": calls},
+            {"content": "", "tool_calls": calls},
+            {"content": "最终答案", "tool_calls": []},
+        ]
+        agent = _make_agent()
+        result = agent.run("测试任务")
+
+        self.assertEqual(result, "最终答案")
+        # 第二次调用的最后一条 tool 消息应为重复提示，而非真实执行结果
+        second_messages = mock_chat_tools.call_args_list[1].args[0]
+        last = second_messages[-1]
+        self.assertEqual(last["role"], "tool")
+        self.assertIn("[重复调用]", last["content"])
+        self.assertNotIn("结果[q1]", last["content"])
+
     @patch("minimate.orchestrator.llm.chat")
     @patch("minimate.orchestrator.llm.chat_tools")
     def test_fc_fallback_to_text(self, mock_chat_tools, mock_chat):

@@ -7,6 +7,7 @@ import unittest
 from minimate.tools import (
     Tool,
     ToolExecutor,
+    classify_error,
     find_files,
     grep_files,
     list_files,
@@ -163,6 +164,19 @@ class SchemaTest(unittest.TestCase):
         params = schema["function"]["parameters"]
         self.assertEqual(sorted(params["required"]), ["content", "path"])
         self.assertEqual(params["properties"]["path"]["type"], "string")
+        self.assertIs(params.get("additionalProperties"), False)
+
+    def test_literal_infers_enum(self):
+        """typing.Literal 注解 → enum 限制取值"""
+        from typing import Literal
+
+        def fake_tool(mode: Literal["chat", "react", "plan"], path: str) -> str:
+            return f"{mode}:{path}"
+
+        params = Tool(name="fake_tool", description="t", func=fake_tool).schema["function"]["parameters"]
+        self.assertEqual(params["properties"]["mode"]["enum"], ["chat", "react", "plan"])
+        self.assertEqual(params["properties"]["mode"]["type"], "string")
+        self.assertEqual(params["required"], ["mode", "path"])
 
     def test_executor_execute_kwargs(self):
         """Function Calling 通道：按命名参数执行"""
@@ -181,6 +195,33 @@ class SchemaTest(unittest.TestCase):
         self.assertEqual(len(tools.schemas), 2)
         names = {s["function"]["name"] for s in tools.schemas}
         self.assertEqual(names, {"read_file", "run_shell"})
+
+
+class ClassifyErrorTest(unittest.TestCase):
+    """错误分级标记"""
+
+    def test_retryable_timeout(self):
+        result = classify_error("[命令超时] 执行超过 30 秒已终止")
+        self.assertTrue(result.startswith("[可重试]"))
+
+    def test_retryable_network(self):
+        result = classify_error("[搜索出错] 网络连接失败")
+        self.assertTrue(result.startswith("[可重试]"))
+
+    def test_non_retryable_not_found(self):
+        result = classify_error("错误：文件不存在 - x.txt")
+        self.assertTrue(result.startswith("[不可重试]"))
+
+    def test_non_retryable_unknown_tool(self):
+        result = classify_error("[工具错误] 未知工具 'x'，可用工具：read_file")
+        self.assertTrue(result.startswith("[不可重试]"))
+
+    def test_normal_result_untouched(self):
+        self.assertEqual(classify_error("文件已写入：a.txt"), "文件已写入：a.txt")
+
+    def test_idempotent(self):
+        result = classify_error("[可重试] 网络连接失败")
+        self.assertEqual(result.count("[可重试]"), 1)
 
 
 if __name__ == "__main__":
