@@ -3,9 +3,18 @@
     "servers": [
       {
         "name": "demo",
+        "transport": "stdio",
         "command": "uv",
         "args": ["run", "python", "examples/mcp_demo_server.py"],
         "env": {}
+      },
+      {
+        "name": "remote",
+        "transport": "http",
+        "url": "http://localhost:9000/mcp",
+        "headers": {
+          "Authorization": "Bearer your-token-here"
+        }
       }
     ]
   }

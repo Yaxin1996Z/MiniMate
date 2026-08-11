@@ -30,18 +30,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from minimate import __version__
-from minimate.tools import (
-    ToolExecutor,
-    save_file,
-    web_search,
-    query_knowledge,
-    read_file,
-    list_files,
-    write_file,
-    run_shell,
-    find_files,
-    grep_files,
-)
+from minimate.tools import ToolExecutor, register_all_tools
 from minimate.memory import ResearchMemory
 from minimate.orchestrator import Agent
 from minimate.rag import get_knowledge_base
@@ -65,9 +54,12 @@ def _load_mcp_tools(tools: ToolExecutor):
         try:
             adapter = McpToolAdapter(
                 server_name=name,
-                command=server["command"],
+                transport=server.get("transport", "stdio"),
+                command=server.get("command"),
                 args=server.get("args", []),
                 env=server.get("env"),
+                url=server.get("url"),
+                headers=server.get("headers"),
             )
             mcp_tools = adapter.connect()
             for t in mcp_tools:
@@ -76,6 +68,29 @@ def _load_mcp_tools(tools: ToolExecutor):
             print(f"  MCP 已加载：{name}（{len(mcp_tools)} 个工具）")
         except Exception as e:
             print(f"  ⚠️ MCP 加载失败：{name} - {e}")
+
+
+def _mcp_status_report() -> str:
+    """生成 MCP 服务器连接状态报告"""
+    if not _mcp_adapters:
+        return "  未配置 MCP 服务器（config.json 的 mcp.servers）"
+    lines = ["  MCP 服务器状态："]
+    icons = {
+        "connected": "✅",
+        "connecting": "⏳",
+        "pending": "⏸",
+        "failed": "❌",
+        "closed": "⏹",
+    }
+    for a in _mcp_adapters:
+        icon = icons.get(a.status, "❓")
+        base = f"    {icon} {a.server_name} [{a.transport}] {a.status}"
+        if a.status == "connected":
+            base += f" · {a.tool_count} 个工具 · {a.connected_at} 连接"
+        if a.error:
+            base += f"\n      错误：{a.error}"
+        lines.append(base)
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -93,6 +108,7 @@ BANNER = r"""
 HELP_TEXT = """
 可用命令：
   /mode <chat|react|plan>   切换执行模式
+  /mcp                      查看 MCP 服务器连接状态
   /memory                   查看当前会话记忆（短期）
   /clear                    清空会话记忆
   /help                     显示本帮助
@@ -114,22 +130,15 @@ def build_agent(
     """装配工具并创建 Agent（单次执行与交互模式共用）"""
 
     tools = ToolExecutor()
-    tools.register(web_search)
-    tools.register(save_file)
-    tools.register(read_file)
-    tools.register(list_files)
-    tools.register(write_file)
-    tools.register(run_shell)
-    tools.register(find_files)
-    tools.register(grep_files)
+    # 注册全部内置工具（按类分组：文件/Shell/Web/RAG，见 tools/registry.py）
+    register_all_tools(tools)
 
-    # 知识库（非空才注册检索工具）
+    # 知识库（用于提示加载状态）
     kb = get_knowledge_base(repo_dir=kb_path)
     if kb.count() > 0:
-        tools.register(query_knowledge)
         print(f"  知识库已加载：{kb.count()} 个片段")
     else:
-        print("  知识库为空，未注册检索工具")
+        print("  知识库为空（query_knowledge 将返回空结果）")
 
     # MCP 工具（config.json 配置了才加载）
     _load_mcp_tools(tools)
@@ -201,6 +210,8 @@ def interactive(kb_path: str = "", max_steps: int = 8):
                 print(color.green(f"  已切换到 {arg} 模式"))
             else:
                 print(color.red("  用法：/mode chat|react|plan"))
+        elif cmd == "/mcp":
+            print(color.cyan(_mcp_status_report()))
         elif cmd == "/memory":
             ctx = memory.get_context()
             print(color.yellow(ctx) if ctx else color.yellow("  记忆为空"))

@@ -157,7 +157,12 @@ docker compose logs -f
 
 ### 6. MCP 接入（可选）
 
-项目支持**本地工具 + MCP 远程工具**双工具源。复制配置模板并填写 MCP Server：
+项目支持**本地工具 + MCP 远程工具**双工具源，MCP 支持两种传输：
+
+- `stdio`：本地子进程连接（通过 stdin/stdout 与 MCP Server 进程通信）
+- `http`：远程 URL 连接（Streamable HTTP，支持认证 headers）
+
+复制配置模板并填写 MCP Server：
 
 ```bash
 cp config.example.json config.json
@@ -169,16 +174,34 @@ cp config.example.json config.json
     "servers": [
       {
         "name": "demo",
+        "transport": "stdio",
         "command": "uv",
         "args": ["run", "python", "examples/mcp_demo_server.py"],
         "env": {}
+      },
+      {
+        "name": "remote",
+        "transport": "http",
+        "url": "http://127.0.0.1:9100/mcp",
+        "headers": { "Authorization": "Bearer xxx" }
       }
     ]
   }
 }
 ```
 
-启动时自动连接配置的 MCP Server，将其工具（`tools/list`）包装进工具系统，Agent 的 Function Calling 循环无感知。示例 Server 提供 `add` / `multiply` / `current_time` 三个工具。
+启动时自动连接配置的 MCP Server，将其工具（`tools/list`）包装进工具系统，Agent 的 Function Calling 循环无感知。
+
+交互模式下可用 `/mcp` 查看各服务器连接状态：
+
+```
+> /mcp
+  MCP 服务器状态：
+    ✅ demo [stdio] connected · 3 个工具
+    ✅ remote [http] connected · 2 个工具
+```
+
+示例 Server：`examples/mcp_demo_server.py`（stdio，add/multiply/current_time）、`examples/mcp_http_server.py`（http，greeting/reverse）。
 
 ---
 
@@ -192,11 +215,20 @@ MiniMate/
 │   └── minimate/
 │       ├── __init__.py           # 包定义
 │       ├── orchestrator.py       # Agent / Task / Crew + 三模式执行
-│       ├── tools.py              # 工具系统 + ReAct 解析
+│       ├── tools/                # 工具系统包（按类分组注册）
+│       │   ├── core.py           # Tool / ToolExecutor / ReAct 解析
+│       │   ├── file_tools.py     # 文件工具（register_file_tools）
+│       │   ├── shell_tools.py    # Shell 命令工具（register_shell_tools）
+│       │   ├── web_tools.py      # 搜索工具（register_web_tools）
+│       │   ├── rag_tools.py      # 知识库工具（register_rag_tools）
+│       │   └── registry.py       # 注册中心（register_all_tools）
 │       ├── memory.py             # 三层记忆（Buffer / Entity / Findings）
 │       ├── llm.py                # LLM API 封装
 │       ├── config.py             # 配置模块（config.json 加载）
-│       ├── mcp.py                # MCP 适配器（远程工具包装为本地 Tool）
+│       ├── mcp/                  # MCP 包（stdio + http 双传输）
+│       │   ├── adapter.py        # McpToolAdapter：统一适配器 + 连接状态机
+│       │   ├── stdio.py          # stdio 传输（本地子进程）
+│       │   └── http.py           # Streamable HTTP 传输（远程 URL）
 │       └── rag/                  # RAG 知识库（Chroma + bge）
 │           ├── __init__.py
 │           ├── config.toml       # 模型路径、目录配置
@@ -206,6 +238,7 @@ MiniMate/
 │   └── test_react.py             # 单元测试（mock，无需 API）
 ├── examples/
 │   └── mcp_demo_server.py        # 示例 MCP Server（FastMCP）
+│   └── mcp_http_server.py        # 示例远程 MCP Server（FastMCP HTTP）
 ├── docs/                         # 设计文档
 ├── output/                       # 工具输出目录
 ├── config.example.json           # 配置模板（MCP servers）
