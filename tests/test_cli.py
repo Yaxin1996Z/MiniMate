@@ -52,7 +52,7 @@ class InteractiveTest(unittest.TestCase):
             interactive()
         out = buf.getvalue()
         self.assertIn("会话记忆已清空", out)
-        self.assertIn("记忆为空", out)
+        self.assertIn("记忆统计", out)  # /memory 显示统计报告
 
 
 if __name__ == "__main__":

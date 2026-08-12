@@ -1,8 +1,9 @@
 """日志与审计 —— 统一 logger + 工具调用审计
 
 输出：
-  - 控制台：同格式日志
   - 文件：logs/minimate.log（UTF-8，按天轮转）
+  - 控制台：默认关闭（避免刷屏），cli --verbose 或环境变量
+    MINIMATE_CONSOLE_LOG=1 开启
 
 审计约定：
   - 工具调用：logger.info("TOOL_CALL tool=... args=... elapsed=...s result=...")
@@ -26,30 +27,44 @@ def _log_file() -> str:
 _FORMAT = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
 
 
-def setup_logger(name: str = "minimate", level: int | None = None) -> logging.Logger:
-    """初始化（或复用）全局 logger：控制台 + 按天轮转文件"""
-    logger = logging.getLogger(name)
-    if logger.handlers:
-        return logger
+def setup_logger(
+    name: str = "minimate",
+    level: int | None = None,
+    console: bool | None = None,
+) -> logging.Logger:
+    """初始化（或复用）全局 logger
 
-    logger.setLevel(level if level is not None else logging.INFO)
+    console=True 时追加控制台输出（默认关闭，避免启动日志刷屏）；
+    文件输出始终开启（按天轮转）。
+    """
+    logger = logging.getLogger(name)
     formatter = logging.Formatter(_FORMAT)
 
-    console = logging.StreamHandler()
-    console.setFormatter(formatter)
-    logger.addHandler(console)
+    if not logger.handlers:
+        logger.setLevel(level if level is not None else logging.INFO)
+        os.makedirs(_log_dir(), exist_ok=True)
+        file_handler = TimedRotatingFileHandler(
+            _log_file(),
+            when="midnight",
+            backupCount=7,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        logger.propagate = False
 
-    os.makedirs(_log_dir(), exist_ok=True)
-    file_handler = TimedRotatingFileHandler(
-        _log_file(),
-        when="midnight",
-        backupCount=7,
-        encoding="utf-8",
+    # 控制台：默认关闭；显式开启或环境变量开启时追加
+    if console is None:
+        console = os.getenv("MINIMATE_CONSOLE_LOG") == "1"
+    has_console = any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in logger.handlers
     )
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    if console and not has_console:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
 
-    logger.propagate = False
     return logger
 
 

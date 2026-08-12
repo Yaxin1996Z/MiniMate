@@ -188,6 +188,16 @@ class SchemaTest(unittest.TestCase):
         with open(target, encoding="utf-8") as f:
             self.assertEqual(f.read(), "FC 内容")
 
+    def test_kwargs_name_remap(self):
+        """参数名容错：file_path → path 模糊映射"""
+        tools = ToolExecutor()
+        tools.register(write_file)
+        target = os.path.join(self.tmp.name, "remap.txt")
+        result = tools.execute("write_file", file_path=target, content="重映射成功")
+        self.assertIn("文件已写入", result)
+        with open(target, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "重映射成功")
+
     def test_executor_schemas(self):
         tools = ToolExecutor()
         tools.register(read_file)

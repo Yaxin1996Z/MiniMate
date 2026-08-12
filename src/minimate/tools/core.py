@@ -45,7 +45,54 @@ class Tool:
             result = self.func(**kwargs)
             return classify_error(str(result))
         except Exception as e:
+            # 参数名不匹配（如 file_path vs path）时，尝试按 Schema 属性名模糊映射
+            remapped = self._remap_kwargs(kwargs)
+            if remapped is not None:
+                try:
+                    result = self.func(**remapped)
+                    return classify_error(str(result))
+                except Exception as e2:
+                    return classify_error(f"[工具错误] {e2}")
             return classify_error(f"[工具错误] {e}")
+
+    def _remap_kwargs(self, kwargs: dict) -> dict | None:
+        """参数名容错：把传入 kwargs 的 key 映射到 Schema 声明的参数名
+
+        匹配规则：精确 → 忽略下划线/大小写 → 包含关系（file_path → path）。
+        必填参数缺失时返回 None（不强行调用）。
+        """
+        props = self.parameters.get("properties", {})
+        if not props:
+            return None
+
+        normalized = {
+            p.replace("_", "").lower(): p for p in props
+        }
+        remapped: dict = {}
+        used: set[str] = set()
+
+        for key, value in kwargs.items():
+            if key in props:
+                remapped[key] = value
+                used.add(key)
+                continue
+            norm = key.replace("_", "").lower()
+            match = normalized.get(norm)
+            if match is None:
+                # 包含关系匹配：file_path → path
+                for pnorm, pname in normalized.items():
+                    if norm in pnorm or pnorm in norm:
+                        match = pname
+                        break
+            if match is None or match in used:
+                return None
+            remapped[match] = value
+            used.add(match)
+
+        required = self.parameters.get("required", [])
+        if required and not all(r in remapped for r in required):
+            return None
+        return remapped
 
     def run_text(self, text: str) -> str:
         """按文本协议执行（fallback 通道）：单参数取整段，多参数按 | 拆分"""

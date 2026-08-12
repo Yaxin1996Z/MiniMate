@@ -7,9 +7,12 @@
   Crew   = 任务调度器（支持 sequential / hierarchical）
 """
 
+from __future__ import annotations
+
 import re
 import json
 import os
+import time
 from typing import Optional
 
 from . import llm
@@ -104,13 +107,18 @@ class Agent:
 
         # 无工具：退化为单次调用
         if not self.tools or not self.tools.tool_list:
-            print(_section("助手思考", f"无可用工具，退化为单次调用（{self.role}）", fg="yellow"))
+            print(_section("系统", f"无可用工具，退化为单次调用（{self.role}）", fg="magenta"))
             result = llm.call(user_msg, system)
             print(_section("助手回答", result, fg="green"))
             return result
 
         # 有工具：推理链逐轮累积到 messages
-        print(_section("助手思考", f"进入 ReAct 循环，最多 {self.max_steps} 步", fg="yellow"))
+        task_preview = task[:50] + ("..." if len(task) > 50 else "")
+        print(_section(
+            "系统",
+            f"进入 ReAct 循环（任务：{task_preview}，最多 {self.max_steps} 步）",
+            fg="magenta",
+        ))
 
         # 双通道：优先 Function Calling，异常时降级到文本协议
         recent_calls: list[tuple[str, str]] = []  # (工具名, 归一化参数)，用于重复调用检测
@@ -124,7 +132,7 @@ class Agent:
             return self._run_react_fc(messages_fc, recent_calls)
         except Exception as e:
             logger.warning("Function Calling 降级到文本协议：%s", e)
-            print(_section("助手思考", f"Function Calling 不可用（{e}），降级到文本协议", fg="yellow"))
+            print(_section("系统", f"Function Calling 不可用（{e}），降级到文本协议", fg="magenta"))
             messages_text = []
             if system:
                 messages_text.append({"role": "system", "content": system})
@@ -134,7 +142,7 @@ class Agent:
     def _run_react_fc(self, messages: list[dict], recent_calls: list[tuple[str, str]]) -> str:
         """Function Calling 通道：模型原生输出 tool_calls，零正则解析"""
         schemas = self.tools.schemas
-        print(_section("助手思考", f"Function Calling 通道（{len(schemas)} 个工具）", fg="yellow"))
+        print(_section("系统", f"Function Calling 通道（{len(schemas)} 个工具）", fg="magenta"))
         last_content = ""
 
         for step in range(1, self.max_steps + 1):
@@ -251,62 +259,239 @@ class Agent:
     # ----------------------------------------------------------
 
     def _run_plan(self, task: str, context: str = "") -> str:
-        """Plan & Execute：生成结构化计划 → 逐步执行 → 汇总最终答案"""
+        """Plan & Execute：生成 DAG 计划 → 拓扑排序 → 分层并行执行 → 汇总"""
 
         print(_section("Plan & Execute", f"任务：{task}", fg="magenta"))
 
-        # 1) 生成计划（结构化 JSON）
-        plan = self._make_plan(task, context)
-        if not plan:
+        # 1) 生成计划（结构化 JSON，含 type/tool/args/depends_on）
+        plan_dicts = self._make_plan(task, context)
+        if not plan_dicts:
             logger.info("Plan&Execute 计划解析失败，回退到 ReAct：%s", task[:80])
-            print(_section("助手思考", "计划解析失败，回退到 ReAct", fg="yellow"))
+            print(_section("系统", "计划解析失败，回退到 ReAct", fg="magenta"))
             return self._run_react(task, context)
 
+        # 2) 建模为 PlanTask（缺失 depends_on 时默认依赖前序步骤，保持线性语义）
+        tasks: list[PlanTask] = []
+        for i, d in enumerate(plan_dicts):
+            prev_id = str(plan_dicts[i - 1].get("id") or plan_dicts[i - 1].get("step") or i - 1)
+            tasks.append(PlanTask.from_dict(
+                d,
+                default_depends_on=[prev_id] if i > 0 else None,
+            ))
+
+        # 3) 拓扑排序：分层批次，同批无依赖可并行
+        try:
+            batches = topo_sort(tasks)
+        except ValueError as e:
+            logger.warning("计划 DAG 异常（%s），回退到顺序执行", e)
+            print(_section("系统", f"计划存在依赖问题（{e}），按顺序执行", fg="magenta"))
+            batches = [[t] for t in tasks]
+
         plan_summary = "\n".join(
-            f"  {i}. {step.get('goal') or step.get('step') or f'步骤 {i}'}"
-            for i, step in enumerate(plan, 1)
+            f"  {t.task_id}. {t.goal} [{t.step_type}]"
+            f"{' -> 依赖 ' + ','.join(t.depends_on) if t.depends_on else ''}"
+            for t in tasks
         )
-        print(_section(f"执行计划（共 {len(plan)} 步）", plan_summary, fg="magenta"))
+        print(_section(
+            f"执行计划（共 {len(tasks)} 步，{len(batches)} 层）",
+            plan_summary,
+            fg="magenta",
+        ))
 
-        # 2) 逐步执行，前序结果作为下一步上下文
-        results: list[str] = []
-        plan_text = json.dumps(plan, ensure_ascii=False, indent=2)
-        for i, step in enumerate(plan, 1):
-            step_goal = step.get("goal") or step.get("step") or f"步骤 {i}"
-            step_detail = step.get("detail") or ""
-            step_text = f"执行计划步骤 {i}/{len(plan)}：{step_goal}"
-            if step_detail:
-                step_text += f"\n具体要求：{step_detail}"
+        # 4) 分层执行：同批并行，结果按 task_id 收集
+        results: dict[str, str] = {}
+        for batch in batches:
+            self._execute_batch(batch, results, task)
 
-            step_ctx = f"【执行计划】\n{plan_text}"
-            if results:
-                step_ctx += "\n\n【已完成步骤】\n" + "\n\n".join(
-                    f"步骤 {j}: {truncate(r, 800)}" for j, r in enumerate(results, 1)
-                )
-
-            if self.tools and self.tools.tool_list:
-                output = self._run_react(step_text, step_ctx)
-            else:
-                output = self._run_chat(step_text, step_ctx)
-            results.append(output)
-
-        # 3) 汇总各步骤结果为最终答案
-        final = self._summarize(task, context, results)
+        # 5) 汇总各步骤结果为最终答案（按原始计划顺序）
+        ordered = [results[t.task_id] for t in tasks]
+        final = self._summarize(task, context, ordered)
         print(_section("助手回答", final, fg="green"))
         return final
+
+    def _execute_batch(
+        self,
+        batch: list[PlanTask],
+        results: dict[str, str],
+        task: str,
+    ) -> None:
+        """执行一批可并行的计划任务"""
+        if len(batch) == 1:
+            t = batch[0]
+            results[t.task_id] = self._execute_plan_task(t, results, task)
+            return
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=min(len(batch), 4)) as executor:
+            futures = {
+                executor.submit(self._execute_plan_task, t, results, task): t
+                for t in batch
+            }
+            for future in as_completed(futures):
+                t = futures[future]
+                results[t.task_id] = future.result()
+
+    def _execute_plan_task(
+        self,
+        t: PlanTask,
+        results: dict[str, str],
+        task: str,
+    ) -> str:
+        """按步骤类型分派执行：
+        action/verify 直连工具（LLM 不参与），失败降级 reason（ReAct）
+        """
+        print(_section("系统", f"执行任务 {t.task_id}（{t.step_type}）：{t.goal}", fg="magenta"))
+
+        dep_ctx = "\n\n".join(
+            f"步骤 {d}: {truncate(results[d], 3000)}"
+            for d in t.depends_on if d in results
+        )
+        fallback_hint = ""
+
+        # --- action：直连工具 ---
+        if t.step_type == "action" and t.tool:
+            args = self._resolve_args(t.args, results)
+            if self.tools and self.tools.tool_list:
+                print(_section(
+                    "工具调用",
+                    f"工具：{t.tool}\n参数：{json.dumps(args, ensure_ascii=False)}",
+                    fg="cyan",
+                ))
+                obs = self.tools.execute(t.tool, **args)
+                print(_section("工具返回", truncate(obs, 1000), fg="magenta"))
+
+                # [可重试] 错误：自动重试一次（间隔 1.5s），避免直接降级浪费 LLM
+                if obs.startswith("[可重试]"):
+                    logger.info("action 直连遇可重试错误，自动重试：%s", t.tool)
+                    time.sleep(1.5)
+                    obs = self.tools.execute(t.tool, **args)
+                    print(_section("工具返回（重试）", truncate(obs, 1000), fg="magenta"))
+
+                if not obs.startswith(("[工具错误]", "[不可重试]", "[可重试]", "错误：")):
+                    logger.info("action 直连成功：%s", t.tool)
+                    return obs
+                logger.info("action 直连失败（%s），降级 ReAct", t.tool)
+                fallback_hint = (
+                    f"\n（注意：直连工具 {t.tool} 已失败并重试：{obs[:80]}。"
+                    "若为网络不可用，请立即停止所有联网尝试（包括 curl/其他网站），"
+                    "直接基于已有知识完成输出并注明'未能联网核实'；"
+                    "否则可换关键词或换工具，但不要重复相同调用。）"
+                )
+            else:
+                logger.info("action 步骤无工具可用，降级 ReAct")
+
+        # --- verify：执行校验命令（缺命令时自动从依赖结果推断） ---
+        if t.step_type == "verify" and self.tools and self.tools.tool_list:
+            command = t.args.get("command", "")
+            if not command:
+                command = self._infer_verify_command(t, results)
+            if command:
+                print(_section(
+                    "工具调用",
+                    f"工具：run_shell\n参数：{json.dumps({'command': command}, ensure_ascii=False)}",
+                    fg="cyan",
+                ))
+                obs = self.tools.execute("run_shell", command=command)
+                print(_section("工具返回", truncate(obs, 1000), fg="magenta"))
+                if "退出码：0" in obs:
+                    logger.info("verify 直连成功")
+                    return obs
+                logger.info("verify 未通过，降级 ReAct")
+                fallback_hint = (
+                    f"\n（注意：校验命令执行失败：{obs[:80]}，请排查后修复或直接说明。）"
+                )
+
+        # --- reason（或降级）：走 ReAct ---
+        step_text = f"执行计划步骤 {t.task_id}：{t.goal}"
+        if t.detail:
+            step_text += f"\n具体要求：{t.detail}"
+        if t.step_type == "verify":
+            step_text += "\n请使用 run_shell 工具实际执行验证命令并确认结果，不要直接回答。"
+        if fallback_hint:
+            step_text += fallback_hint
+        step_ctx = f"【当前步骤】{t.task_id}：{t.goal}"
+        if dep_ctx:
+            step_ctx += f"\n\n【依赖步骤结果】\n{dep_ctx}"
+
+        if self.tools and self.tools.tool_list:
+            output = self._run_react(step_text, step_ctx)
+        else:
+            output = self._run_chat(step_text, step_ctx)
+
+        # 步骤结果写入记忆（供后续 reason 步骤通过 memory 上下文复用）
+        if self.memory:
+            self.memory.add_ai_message(f"计划步骤 {t.task_id} 结果：\n{output}")
+        return output
+
+    def _infer_verify_command(self, t: PlanTask, results: dict[str, str]) -> str:
+        """verify 步骤缺命令时，从依赖步骤的 write_file 结果推断校验命令"""
+        import re
+
+        for dep in t.depends_on:
+            text = results.get(dep, "")
+            m = re.search(r"文件已写入：(.+?)(?:（|\n|$)", text)
+            if m:
+                path = m.group(1).strip()
+                if path.endswith(".py"):
+                    return f"python {path}"
+                return f"python -c \"import os; assert os.path.exists('{path}'), 'not found'; print('exists')\""
+        return ""
+
+    def _resolve_args(self, args: dict, results: dict[str, str]) -> dict:
+        """解析 action 步骤参数：支持 {"ref": "步骤id"} 对象引用与 {ref:步骤id} / {步骤id} 内联引用
+
+        未解析的引用替换为可见标记（如 [未解析引用: step1]），避免静默写入错误内容。
+        """
+        resolved: dict = {}
+        for key, value in args.items():
+            if isinstance(value, dict) and "ref" in value:
+                ref = str(value["ref"])
+                resolved[key] = results.get(ref, f"[未解析引用: {ref}]")
+            elif isinstance(value, str):
+                resolved[key] = self._resolve_refs(value, results)
+            else:
+                resolved[key] = value
+        return resolved
+
+    def _resolve_refs(self, text: str, results: dict[str, str]) -> str:
+        """替换 {ref:步骤id} 与 {步骤id} 内联引用；缺失时替换为可见标记"""
+        def repl(match) -> str:
+            ref = match.group(1) or match.group(2)
+            if ref in results:
+                return results[ref]
+            logger.warning("action 参数引用未解析：%s", ref)
+            return f"[未解析引用: {ref}]"
+
+        text = re.sub(r"\{ref:([\w\-]+)\}", repl, text)
+        text = re.sub(r"\{([\w\-]+)\}", repl, text)
+        return text
 
     def _make_plan(self, task: str, context: str = "") -> list[dict]:
         """让 LLM 输出结构化 JSON 计划（步骤数组）"""
         system = (
             "你是任务规划专家，擅长把模糊任务分解为清晰、可执行、顺序合理的步骤。"
         )
+        tools_hint = ""
+        if self.tools and self.tools.tool_list:
+            tools_hint = "\n\n可用工具（args 的参数名必须与签名完全一致）：\n" + "\n".join(
+                f"  - {t.name}({', '.join(t.parameters['properties'])}) : {t.description[:60]}"
+                for t in self.tools.tool_list
+            )
         prompt = (
             f"为以下任务制定分步执行计划：\n任务：{task}\n\n"
             "输出 JSON 数组（不要输出任何其他内容），每个元素包含：\n"
-            "  - step: 步骤短名称\n"
+            "  - id: 步骤唯一标识（如 step1）\n"
             "  - goal: 该步骤目标（一句话）\n"
+            "  - type: 步骤类型（reason=需 LLM 推理/生成；"
+            "action=确定性操作直连工具；verify=执行校验命令）\n"
             "  - detail: 具体执行内容（1-2 句话）\n"
-            "要求：2-5 步，步骤间有依赖顺序，覆盖任务全部要求。"
+            "  - tool: action/verify 步骤使用的工具名（reason 步骤省略）；"
+            "verify 步骤用 run_shell，args.command 写校验命令）\n"
+            "  - args: 工具参数对象；值可用 {\"ref\": \"步骤id\"} 引用前序步骤结果\n"
+            "  - depends_on: 依赖的步骤 id 数组（无依赖省略；默认线性依赖前一步）\n"
+            "要求：2-5 步；能用 action 直连的步骤不要用 reason，"
+            "减少 LLM 参与；覆盖任务全部要求。"
+            f"{tools_hint}"
         )
         if context:
             prompt += f"\n\n参考上下文：\n{truncate(context, 1500)}"
@@ -336,7 +521,8 @@ class Agent:
         if context:
             user_msg += f"\n\n可以参考以下上下文：\n{context}"
         if self.memory:
-            mem_ctx = self.memory.get_context()
+            # 按当前任务检索相关长期记忆注入（避免全量事实混入）
+            mem_ctx = self.memory.get_retrieved_context(task, max_tokens=2000)
             if mem_ctx:
                 user_msg = f"{mem_ctx}\n\n{user_msg}"
         return user_msg
@@ -414,6 +600,79 @@ def parse_plan(text: str) -> list[dict]:
     if isinstance(data, list) and all(isinstance(x, dict) for x in data):
         return data
     return []
+
+
+# ============================================================
+# 计划任务建模 + DAG 拓扑排序
+# ============================================================
+
+class PlanTask:
+    """计划步骤（Task 建模）：id + goal + 类型 + 依赖 + 工具
+
+    step_type：
+      reason - 需 LLM 推理/生成（走 ReAct）
+      action - 确定性动作（直连工具，LLM 不参与）
+      verify - 校验（执行命令检查，失败才升级 LLM）
+    """
+
+    def __init__(
+        self,
+        task_id: str,
+        goal: str,
+        step_type: str = "reason",
+        detail: str = "",
+        tool: str = "",
+        args: dict | None = None,
+        depends_on: list[str] | None = None,
+    ):
+        self.task_id = str(task_id)
+        self.goal = goal
+        self.step_type = step_type
+        self.detail = detail
+        self.tool = tool
+        self.args = args or {}
+        self.depends_on = [str(d) for d in (depends_on or [])]
+        self.result = ""
+
+    @classmethod
+    def from_dict(cls, data: dict, default_depends_on: list[str] | None = None) -> "PlanTask":
+        return cls(
+            task_id=data.get("id") or data.get("step") or "step",
+            goal=data.get("goal") or data.get("step") or "步骤",
+            step_type=data.get("type", "reason"),
+            detail=data.get("detail", ""),
+            tool=data.get("tool", ""),
+            args=data.get("args") or {},
+            depends_on=data.get("depends_on") or default_depends_on,
+        )
+
+
+def topo_sort(tasks: list[PlanTask]) -> list[list[PlanTask]]:
+    """Kahn 拓扑排序：返回分层批次（同批内可并行执行），检测循环依赖"""
+    by_id = {t.task_id: t for t in tasks}
+    for t in tasks:
+        for dep in t.depends_on:
+            if dep not in by_id:
+                raise ValueError(f"计划依赖不存在：{dep}")
+
+    indegree = {t.task_id: len(t.depends_on) for t in tasks}
+    children: dict[str, list[str]] = {t.task_id: [] for t in tasks}
+    for t in tasks:
+        for dep in t.depends_on:
+            children[dep].append(t.task_id)
+
+    batches: list[list[PlanTask]] = []
+    remaining = set(t.task_id for t in tasks)
+    while remaining:
+        ready = [tid for tid in remaining if indegree[tid] == 0]
+        if not ready:
+            raise ValueError("计划存在循环依赖")
+        batches.append([by_id[tid] for tid in sorted(ready)])
+        for tid in ready:
+            remaining.remove(tid)
+            for child in children[tid]:
+                indegree[child] -= 1
+    return batches
 
 
 # ============================================================

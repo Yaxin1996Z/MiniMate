@@ -8,7 +8,11 @@ def web_search(query: str) -> str:
     """搜索互联网，返回最新信息"""
     query = _first_line(query)
     try:
-        from duckduckgo_search import DDGS
+        # 优先使用改名后的 ddgs 新包；旧包作为 fallback
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
         results = []
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=5):

@@ -31,7 +31,7 @@ class OAuthError(Exception):
 
 
 def _cache_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "..", ".cache", "tokens.json")
+    return os.path.join(os.path.dirname(__file__), "..", "..", "..", ".cache", "tokens.json")
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):

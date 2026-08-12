@@ -14,7 +14,7 @@ try:
 except Exception:
     pass
 
-from minimate.orchestrator import Agent, parse_plan
+from minimate.orchestrator import Agent, PlanTask, parse_plan, topo_sort
 from minimate.tools import Tool, ToolExecutor, parse_react, truncate
 
 
@@ -241,6 +241,121 @@ class AgentModeTest(unittest.TestCase):
         self.assertEqual(result, "最终汇总答案")
         self.assertEqual(mock_call.call_count, 4)  # 计划 + 2 步骤 + 汇总
         mock_chat.assert_not_called()
+
+    @patch("minimate.orchestrator.llm.chat_tools")
+    @patch("minimate.orchestrator.llm.call")
+    def test_plan_action_direct(self, mock_call, mock_chat_tools):
+        """action 步骤直连工具，LLM 不参与（只计划 + 汇总两次调用）"""
+        plan_json = json.dumps([{
+            "id": "step1",
+            "goal": "写入文件",
+            "type": "action",
+            "tool": "fake_tool",
+            "args": {"args": "hello"},
+            "depends_on": [],
+        }], ensure_ascii=False)
+        mock_call.side_effect = [plan_json, "最终答案"]
+        agent = _make_agent()
+        result = agent.run("任务", mode="plan")
+        self.assertEqual(result, "最终答案")
+        mock_chat_tools.assert_not_called()  # action 直连，不进 ReAct
+        self.assertEqual(mock_call.call_count, 2)  # 计划 + 汇总
+
+    @patch("minimate.orchestrator.llm.chat_tools", return_value={"content": "降级处理", "tool_calls": []})
+    @patch("minimate.orchestrator.llm.call")
+    @patch("minimate.orchestrator.time.sleep")
+    def test_action_retry_on_retryable(self, mock_sleep, mock_call, mock_chat_tools):
+        """action 直连遇 [可重试] 错误：自动重试一次，而非立即降级 LLM"""
+        calls = {"n": 0}
+
+        def flaky(args):
+            calls["n"] += 1
+            return "[可重试] 网络错误"
+
+        tools = ToolExecutor()
+        tools.register(Tool(name="flaky", description="t", func=flaky))
+        agent = Agent(role="测试", goal="g", tools=tools, max_steps=3)
+        plan_json = json.dumps([{
+            "id": "s1", "goal": "x", "type": "action",
+            "tool": "flaky", "args": {"args": "a"},
+        }], ensure_ascii=False)
+        mock_call.side_effect = [plan_json, "汇总"]
+
+        agent.run("任务", mode="plan")
+
+        self.assertEqual(calls["n"], 2)  # 首试 + 自动重试
+        mock_sleep.assert_called()       # 重试有间隔
+
+
+class PlanDagTest(unittest.TestCase):
+    """DAG 拓扑排序与参数引用"""
+
+    def test_topo_sort_batches(self):
+        tasks = [
+            PlanTask("a", "A", depends_on=[]),
+            PlanTask("b", "B", depends_on=["a"]),
+            PlanTask("c", "C", depends_on=["a"]),
+            PlanTask("d", "D", depends_on=["b", "c"]),
+        ]
+        batches = topo_sort(tasks)
+        self.assertEqual([t.task_id for t in batches[0]], ["a"])
+        self.assertEqual(sorted(t.task_id for t in batches[1]), ["b", "c"])
+        self.assertEqual([t.task_id for t in batches[2]], ["d"])
+
+    def test_topo_sort_cycle_raises(self):
+        tasks = [
+            PlanTask("a", "A", depends_on=["b"]),
+            PlanTask("b", "B", depends_on=["a"]),
+        ]
+        with self.assertRaises(ValueError):
+            topo_sort(tasks)
+
+    def test_topo_sort_missing_dep_raises(self):
+        tasks = [PlanTask("a", "A", depends_on=["nope"])]
+        with self.assertRaises(ValueError):
+            topo_sort(tasks)
+
+    def test_resolve_args_ref(self):
+        agent = _make_agent()
+        resolved = agent._resolve_args(
+            {"content": {"ref": "step1"}, "path": "x.txt"},
+            {"step1": "结果X"},
+        )
+        self.assertEqual(resolved["content"], "结果X")
+        self.assertEqual(resolved["path"], "x.txt")
+
+    def test_resolve_args_inline_ref(self):
+        """内联引用 {ref:step1} 与 {step1} 均被替换"""
+        agent = _make_agent()
+        resolved = agent._resolve_args(
+            {"content": "标题\n{ref:step1}\n{step2}"},
+            {"step1": "搜索A", "step2": "搜索B"},
+        )
+        self.assertEqual(resolved["content"], "标题\n搜索A\n搜索B")
+
+    def test_resolve_args_missing_ref_marked(self):
+        """缺失引用替换为可见标记，不静默写入错误内容"""
+        agent = _make_agent()
+        resolved = agent._resolve_args(
+            {"content": "{ref:nope}"},
+            {"step1": "X"},
+        )
+        self.assertIn("[未解析引用: nope]", resolved["content"])
+
+    def test_infer_verify_command_py(self):
+        """verify 缺命令时，从依赖步骤的 write_file 结果推断 python 执行命令"""
+        agent = _make_agent()
+        task = PlanTask("v", "验证", step_type="verify", depends_on=["a"])
+        cmd = agent._infer_verify_command(task, {
+            "a": "文件已写入：example/topological_sort.py（1517 字符）",
+        })
+        self.assertEqual(cmd, "python example/topological_sort.py")
+
+    def test_infer_verify_command_no_file(self):
+        agent = _make_agent()
+        task = PlanTask("v", "验证", step_type="verify", depends_on=["a"])
+        cmd = agent._infer_verify_command(task, {"a": "没有文件信息"})
+        self.assertEqual(cmd, "")
 
     def test_invalid_mode_raises(self):
         agent = _make_agent()

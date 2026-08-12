@@ -31,7 +31,7 @@ load_dotenv()
 
 from minimate import __version__
 from minimate.tools import ToolExecutor, register_all_tools
-from minimate.memory import ResearchMemory
+from minimate.memory import MemoryManager
 from minimate.orchestrator import Agent
 from minimate.rag import get_knowledge_base
 from minimate.colors import color
@@ -95,6 +95,45 @@ def _mcp_status_report() -> str:
     return "\n".join(lines)
 
 
+def _stats_report() -> str:
+    """生成 LLM Token 用量统计报告"""
+    from minimate.llm import get_stats
+
+    s = get_stats()
+    total = s["prompt_tokens"] + s["completion_tokens"]
+    return (
+        "  LLM 用量统计：\n"
+        f"    调用次数：{s['calls']}\n"
+        f"    prompt tokens：{s['prompt_tokens']}\n"
+        f"    completion tokens：{s['completion_tokens']}\n"
+        f"    合计：{total} tokens"
+    )
+
+
+def _memory_report(memory) -> str:
+    """生成记忆系统报告（统计 + 长期事实 + 摘要 + 短期上下文）"""
+    stats = memory.stats()
+    lines = [
+        f"  记忆统计：短期 {stats['short_term_items']} 条"
+        f"（{stats['short_term_tokens']} tokens）· "
+        f"摘要 {stats['summaries']} 条 · "
+        f"长期事实 {stats['long_term_facts']} 条",
+    ]
+    facts = memory.long_term.items
+    if facts:
+        lines.append("\n  【长期记忆】")
+        lines.extend(f"    - {f.content[:100]}" for f in facts[-5:])
+    summaries = memory.short_term.get_summaries()
+    if summaries:
+        lines.append("\n  【历史摘要】")
+        lines.append("    " + summaries.replace("\n", "\n    "))
+    ctx = memory.get_context()
+    if ctx:
+        lines.append("\n  【短期上下文】")
+        lines.append("    " + ctx[:400].replace("\n", "\n    "))
+    return "\n".join(lines)
+
+
 # ============================================================
 # 交互模式界面
 # ============================================================
@@ -111,6 +150,7 @@ HELP_TEXT = """
 可用命令：
   /mode <chat|react|plan>   切换执行模式
   /mcp                      查看 MCP 服务器连接状态
+  /stats                    查看 LLM Token 用量统计
   /memory                   查看当前会话记忆（短期）
   /clear                    清空会话记忆
   /help                     显示本帮助
@@ -125,7 +165,7 @@ HELP_TEXT = """
 # ============================================================
 
 def build_agent(
-    memory: ResearchMemory,
+    memory: MemoryManager,
     kb_path: str = "",
     max_steps: int = 8,
 ) -> Agent:
@@ -166,7 +206,7 @@ def run_query(
 ) -> str:
     """以指定模式执行一次任务，返回最终答案"""
 
-    memory = ResearchMemory()
+    memory = MemoryManager()
     memory.add_user_message(question)
     agent = build_agent(memory, kb_path, max_steps)
 
@@ -176,7 +216,9 @@ def run_query(
     print(f"  启动时间：{datetime.now().strftime('%H:%M:%S')}")
     print(color.cyan(f"{'=' * 60}"))
 
-    return agent.run(question, mode=mode)
+    answer = agent.run(question, mode=mode)
+    memory.save()  # 长期事实持久化，跨会话保留
+    return answer
 
 
 # ============================================================
@@ -188,10 +230,10 @@ def interactive(kb_path: str = "", max_steps: int = 8):
 
     print(color.cyan(BANNER))
     print(color.cyan(f"  MiniMate v{__version__}", bold=True) + "  ·  工作/代码助手 Agent")
-    print(f"  会话记忆为短期记忆（内存中），退出后自动清除")
+    print(f"  短期记忆自动管理（Token 预算 + 压缩）；长期记忆持久化到 .cache/memory.json")
     print(f"  输入 /help 查看命令，Ctrl+C 退出")
 
-    memory = ResearchMemory()
+    memory = MemoryManager()
     agent = build_agent(memory, kb_path, max_steps)
     mode = "react"
     print(color.green(f"\n  当前模式：{mode}", bold=True) + "（可用 /mode chat|plan 切换）")
@@ -214,9 +256,10 @@ def interactive(kb_path: str = "", max_steps: int = 8):
                 print(color.red("  用法：/mode chat|react|plan"))
         elif cmd == "/mcp":
             print(color.cyan(_mcp_status_report()))
+        elif cmd == "/stats":
+            print(color.cyan(_stats_report()))
         elif cmd == "/memory":
-            ctx = memory.get_context()
-            print(color.yellow(ctx) if ctx else color.yellow("  记忆为空"))
+            print(color.yellow(_memory_report(memory)))
         elif cmd == "/clear":
             memory.clear()
             print(color.green("  会话记忆已清空"))
@@ -229,6 +272,7 @@ def interactive(kb_path: str = "", max_steps: int = 8):
             try:
                 line = input(color.green("\n> ", bold=True)).strip()
             except EOFError:
+                memory.save()
                 print(color.green("\n  再见！会话记忆已清除"))
                 break
 
@@ -237,15 +281,16 @@ def interactive(kb_path: str = "", max_steps: int = 8):
 
             if line.startswith("/"):
                 if not handle_command(line):
+                    memory.save()
                     print(color.green("  再见！会话记忆已清除"))
                     break
                 continue
 
             memory.add_user_message(line)
             answer = agent.run(line, mode=mode)
-            print(f"\n{answer}")
             memory.add_ai_message(answer)
     except KeyboardInterrupt:
+        memory.save()
         print(color.green("\n\n  再见！会话记忆已清除"))
 
 
@@ -283,8 +328,13 @@ def cli():
     parser.add_argument("--max-steps", type=int, default=8, help="ReAct 最大循环步数")
     parser.add_argument("--rebuild", action="store_true", help="强制重建知识库索引")
     parser.add_argument("--version", "-v", action="store_true", help="显示版本")
+    parser.add_argument("--verbose", action="store_true", help="开启控制台日志（默认仅写入文件）")
 
     args = parser.parse_args()
+
+    if args.verbose:
+        from minimate.logging import setup_logger
+        setup_logger(console=True)
 
     print(f"  日志：{log_path()}")
 
@@ -309,10 +359,7 @@ def cli():
         kb_path=args.kb_path,
         max_steps=args.max_steps,
     )
-    print(color.green(f"\n{'=' * 60}"))
-    print(color.green("  最终答案：", bold=True))
-    print(color.green(f"{'=' * 60}"))
-    print(answer)
+    print(f"\n{_stats_report()}")
 
 
 def main():
