@@ -260,6 +260,87 @@ class MemoryManagerTest(unittest.TestCase):
         self.assertTrue(
             any("工作到十点" in f.content for f in mem.long_term.items)
         )
+
+    def test_repo_scope_filtering(self):
+        """检索时按仓库名隔离：提到某仓库只注入该仓库 + global 的事实"""
+        mem = MemoryManager(memory_path=self.path)
+        mem.set_repos(["minimate", "other"])
+        mem.store_fact(
+            "项目信息：代码仓库 minimate 使用 FastAPI",
+            scope="project",
+            project="minimate",
+        )
+        mem.store_fact(
+            "项目信息：代码仓库 other 使用 Vue",
+            scope="project",
+            project="other",
+        )
+        mem.store_fact("用户偏好：minimate 相关讨论用中文", scope="global")
+
+        ctx_mini = mem.get_retrieved_context("minimate 的架构是什么", max_tokens=2000)
+        self.assertIn("FastAPI", ctx_mini)
+        self.assertNotIn("Vue", ctx_mini)
+        self.assertIn("minimate 相关讨论用中文", ctx_mini)  # global 跨仓库可见
+
+    def test_extract_facts_from_messages(self):
+        """回合末提取：LLM 输出 JSON 事实，按 scope/repo 入库并去重"""
+        mem = MemoryManager(memory_path=self.path)
+        messages = [
+            {"role": "user", "content": "以后接口都用 FastAPI 写"},
+            {"role": "assistant", "content": "好的"},
+        ]
+        with patch(
+            "minimate.memory.manager.llm.call",
+            return_value=(
+                '[{"content": "用户偏好：接口用FastAPI", "scope": "global"},'
+                '{"content": "项目信息：MiniMate用FastAPI", "scope": "repo", "repo": "minimate"}]'
+            ),
+        ):
+            count = mem.extract_facts_from_messages(messages)
+        self.assertEqual(count, 2)
+        facts = mem.list_long_term()
+        self.assertTrue(any(f.metadata.get("scope") == "global" for f in facts))
+        self.assertTrue(
+            any(f.metadata.get("project") == "minimate" for f in facts)
+        )
+
+        # 再次提取相同内容 → 归一化去重，不再新增
+        with patch(
+            "minimate.memory.manager.llm.call",
+            return_value='[{"content": "用户偏好：接口用FastAPI", "scope": "global"}]',
+        ):
+            count2 = mem.extract_facts_from_messages(messages)
+        self.assertEqual(count2, 0)
+
+    def test_extract_facts_from_messages(self):
+        """回合末提取：LLM 输出 JSON 事实，按 scope/repo 入库并去重"""
+        mem = MemoryManager(memory_path=self.path)
+        messages = [
+            {"role": "user", "content": "以后接口都用 FastAPI 写"},
+            {"role": "assistant", "content": "好的"},
+        ]
+        with patch(
+            "minimate.memory.manager.llm.call",
+            return_value=(
+                '[{"content": "用户偏好：接口用FastAPI", "scope": "global"},'
+                '{"content": "项目信息：MiniMate用FastAPI", "scope": "repo", "repo": "minimate"}]'
+            ),
+        ):
+            count = mem.extract_facts_from_messages(messages)
+        self.assertEqual(count, 2)
+        facts = mem.list_long_term()
+        self.assertTrue(any(f.metadata.get("scope") == "global" for f in facts))
+        self.assertTrue(
+            any(f.metadata.get("project") == "minimate" for f in facts)
+        )
+
+        # 再次提取相同内容 → 归一化去重，不再新增
+        with patch(
+            "minimate.memory.manager.llm.call",
+            return_value='[{"content": "用户偏好：接口用FastAPI", "scope": "global"}]',
+        ):
+            count2 = mem.extract_facts_from_messages(messages)
+        self.assertEqual(count2, 0)
         self.assertTrue(
             any("FastAPI" in f.content for f in mem.long_term.items)
         )

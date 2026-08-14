@@ -48,6 +48,20 @@ class InteractiveTest(unittest.TestCase):
         self.assertIn("用法：/mode chat|react|plan", out)
         self.assertIn("已切换到 plan 模式", out)
 
+    @patch("cli._input_line", side_effect=["/mode multi", "写一个文件", "/quit"])
+    @patch("cli.MultiAgentOrchestrator")
+    def test_mode_multi_uses_orchestrator(self, mock_orch, mock_input):
+        """交互模式 /mode multi 后，提问必须走多 Agent 编排器而非 agent.run"""
+        instance = mock_orch.return_value
+        instance.run.return_value = "多 Agent 汇总结果"
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            interactive()
+        out = buf.getvalue()
+        self.assertIn("已切换到 multi 模式", out)
+        mock_orch.assert_called_once()
+        instance.run.assert_called_once_with("写一个文件")
+
     @patch("cli._input_line", side_effect=["/clear", "/memory", "/quit"])
     def test_clear_and_memory(self, mock_input):
         buf = io.StringIO()
@@ -128,12 +142,13 @@ class ReposCommandTest(unittest.TestCase):
         result = _repos_command("add demo D:/tmp/proj", memory=self.mem)
         self.assertIn("已配置仓库", result)
         facts = self.mem.list_long_term()
-        self.assertTrue(
-            any(
-                "代码仓库 demo" in f.content and "search_code" in f.content
-                for f in facts
-            )
-        )
+        repo_facts = [
+            f
+            for f in facts
+            if "代码仓库 demo" in f.content and "search_code" in f.content
+        ]
+        self.assertTrue(repo_facts)
+        self.assertEqual(repo_facts[0].metadata.get("project"), "demo")
 
     @patch("minimate.coderag.CodeRAGManager")
     def test_index_replaces_memory_fact(self, mock_cls):

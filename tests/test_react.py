@@ -206,6 +206,41 @@ class AgentReactLoopTest(unittest.TestCase):
         self.assertTrue(record.ok)
         self.assertTrue(record.loop_id.startswith("loop-"))
 
+    @patch("minimate.memory.manager.llm.call", return_value="[]")
+    @patch("minimate.agent.agent.llm.chat_tools")
+    def test_round_facts_extracted_after_run(self, mock_chat_tools, mock_llm_call):
+        """任务结束后触发回合末记忆提取（每轮一次）"""
+        import os
+        import tempfile
+
+        from minimate.memory import MemoryManager
+
+        tools = ToolExecutor()
+        tools.register(
+            Tool(name="fake_tool", description="t", func=lambda args: "ok")
+        )
+        mock_chat_tools.side_effect = [
+            {"content": "", "tool_calls": [self._fc_call()]},
+            {"content": "最终答案", "tool_calls": []},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            mem = MemoryManager(memory_path=os.path.join(d, "m.db"))
+            with patch.object(
+                mem,
+                "extract_facts_from_messages",
+                wraps=mem.extract_facts_from_messages,
+            ) as mock_extract:
+                agent = Agent(
+                    role="测试",
+                    goal="g",
+                    tools=tools,
+                    memory=mem,
+                    max_steps=2,
+                )
+                result = agent.run("任务")
+                self.assertEqual(result, "最终答案")
+                mock_extract.assert_called()
+
     @patch("minimate.agent.agent.llm.chat_tools")
     def test_repeat_call_detected(self, mock_chat_tools):
         """相同工具相同参数连续调用 → 第二次起不执行，回灌重复提示"""

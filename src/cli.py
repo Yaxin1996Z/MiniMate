@@ -6,6 +6,7 @@ MiniMate CLI —— 工作/代码助手，支持三种 Agent 模式
   minimate "问题" --mode chat         # 纯问答（单次 LLM 调用）
   minimate "问题" --mode react        # ReAct 循环（工具调用）
   minimate "问题" --mode plan         # Plan & Execute
+  minimate "问题" --mode multi        # Multi-Agent（规划者/执行者/检查者协作）
   minimate "问题" --kb-path ./docs    # 加载自定义知识库
   minimate --rebuild                  # 重建知识库索引
   minimate                            # 交互模式（多轮对话，短期记忆）
@@ -30,9 +31,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from minimate import __version__
-from minimate.tools import ToolExecutor, register_all_tools
+from minimate.tools import Tool, ToolExecutor, register_all_tools
 from minimate.memory import MemoryManager
-from minimate.agent import Agent
+from minimate.agent import Agent, MultiAgentOrchestrator
 from minimate.rag import get_knowledge_base
 from minimate.colors import color
 from minimate.config import get_mcp_servers
@@ -148,7 +149,19 @@ def _remember_repo_index(memory, name: str, chunks: int | None = None):
             f"项目信息：代码仓库 {name} 已建立索引（{chunks} 个代码块），"
             "查询该仓库代码请直接使用 search_code 工具检索"
         )
-    memory.store_fact(fact, source="coderag")
+    memory.store_fact(fact, source="coderag", project=name)
+
+
+def _memory_with_repos() -> MemoryManager:
+    """创建带已配置仓库登记的记忆管理器（用于检索时按仓库过滤）"""
+    memory = MemoryManager()
+    try:
+        from minimate.coderag import CodeRAGManager
+
+        memory.set_repos(list(CodeRAGManager().list_repos().keys()))
+    except Exception:
+        pass
+    return memory
 
 
 def _repos_command(args: str, memory=None) -> str:
@@ -226,6 +239,29 @@ def _repos_command(args: str, memory=None) -> str:
     )
 
 
+def _save_fact(memory: MemoryManager):
+    """长期记忆写入工具：scope=global 用户偏好（跨项目）；scope=repo 仓库事实"""
+    from typing import Literal
+
+    def save_fact(
+        content: str,
+        scope: Literal["global", "repo"] = "repo",
+        repo: str = "",
+    ) -> str:
+        if not content or len(content.strip()) < 4:
+            return "[错误] 内容太短，未保存"
+        internal_scope = "global" if scope == "global" else "project"
+        ok = memory.store_fact(
+            content.strip(),
+            scope=internal_scope,
+            project=repo.strip() or None,
+            source="agent",
+        )
+        return "已保存到长期记忆" if ok else "内容重复或无效，跳过"
+
+    return save_fact
+
+
 # ============================================================
 # 交互模式界面
 # ============================================================
@@ -240,7 +276,7 @@ BANNER = r"""
 
 HELP_TEXT = """
 可用命令：
-  /mode <chat|react|plan>   切换执行模式
+  /mode <chat|react|plan|multi>   切换执行模式
   /mcp                      查看 MCP 服务器连接状态
   /stats                    查看 LLM Token 用量统计
   /repos                    配置/索引/更新/检索代码仓库（Code RAG）
@@ -269,6 +305,20 @@ def build_agent(
     register_all_tools(tools)
     # Code RAG 检索工具（配置了代码仓库后可用）
     tools.register(search_code)
+    # 长期记忆写入工具：模型在对话中主动保存跨会话事实
+    tools.register(
+        Tool(
+            name="save_fact",
+            description=(
+                "把一条跨会话稳定的信息保存到长期记忆。"
+                "scope=global 用于用户偏好/习惯（跨项目通用）；"
+                "scope=repo 用于代码仓库/项目相关事实（可指定 repo 仓库名）。"
+                "只保存值得长期记住的稳定信息（偏好、约定、项目技术栈等），"
+                "不要保存临时任务、一次性指令或当前对话过程。"
+            ),
+            func=_save_fact(memory),
+        )
+    )
 
     # 知识库（用于提示加载状态）
     kb = get_knowledge_base(repo_dir=kb_path)
@@ -294,6 +344,24 @@ def build_agent(
     )
 
 
+def _run_agent_query(
+    question: str,
+    mode: str,
+    agent: Agent,
+    memory: MemoryManager,
+    max_steps: int = 8,
+) -> str:
+    """按模式执行一次任务：multi 走多 Agent 编排器，其余走单 Agent"""
+    if mode == "multi":
+        orchestrator = MultiAgentOrchestrator(
+            tools=agent.tools,
+            memory=memory,
+            max_steps=max_steps,
+        )
+        return orchestrator.run(question)
+    return agent.run(question, mode=mode)
+
+
 def run_query(
     question: str,
     mode: str = "react",
@@ -302,7 +370,7 @@ def run_query(
 ) -> str:
     """以指定模式执行一次任务，返回最终答案"""
 
-    memory = MemoryManager()
+    memory = _memory_with_repos()
     memory.add_user_message(question)
     agent = build_agent(memory, kb_path, max_steps)
 
@@ -312,7 +380,7 @@ def run_query(
     print(f"  启动时间：{datetime.now().strftime('%H:%M:%S')}")
     print(color.cyan(f"{'=' * 60}"))
 
-    answer = agent.run(question, mode=mode)
+    answer = _run_agent_query(question, mode, agent, memory, max_steps)
     memory.save()  # 长期事实持久化，跨会话保留
     return answer
 
@@ -426,11 +494,11 @@ def interactive(kb_path: str = "", max_steps: int = 8):
     print(f"  短期记忆自动管理（Token 预算 + 压缩）；长期记忆持久化到 ~/.minimate/memory.db")
     print(f"  输入 /help 查看命令，Ctrl+C 退出")
 
-    memory = MemoryManager()
+    memory = _memory_with_repos()
     agent = build_agent(memory, kb_path, max_steps)
     mode = "react"
     history: list[str] = []
-    print(color.green(f"\n  当前模式：{mode}", bold=True) + "（可用 /mode chat|plan 切换）")
+    print(color.green(f"\n  当前模式：{mode}", bold=True) + "（可用 /mode chat|plan|multi 切换）")
 
     def handle_command(line: str) -> bool:
         """处理斜杠命令，返回 False 表示退出"""
@@ -443,11 +511,11 @@ def interactive(kb_path: str = "", max_steps: int = 8):
         elif cmd in ("/quit", "/exit"):
             return False
         elif cmd == "/mode":
-            if arg in ("chat", "react", "plan"):
+            if arg in ("chat", "react", "plan", "multi"):
                 mode = arg
                 print(color.green(f"  已切换到 {arg} 模式"))
             else:
-                print(color.red("  用法：/mode chat|react|plan"))
+                print(color.red("  用法：/mode chat|react|plan|multi"))
         elif cmd == "/mcp":
             print(color.cyan(_mcp_status_report()))
         elif cmd == "/stats":
@@ -494,7 +562,7 @@ def interactive(kb_path: str = "", max_steps: int = 8):
                 continue
 
             memory.add_user_message(line)
-            answer = agent.run(line, mode=mode)
+            answer = _run_agent_query(line, mode, agent, memory, max_steps)
             memory.add_ai_message(answer)
     except KeyboardInterrupt:
         memory.save()
@@ -519,6 +587,7 @@ def cli():
   minimate "什么是 RAG" --mode chat                # 纯问答
   minimate "帮我搜索 MCP 最新进展" --mode react     # ReAct 循环
   minimate "对比 RAG 和微调方案" --mode plan        # Plan & Execute
+  minimate "重构工具注册模块" --mode multi          # Multi-Agent 协作
   minimate "Python 装饰器" --kb-path ./docs        # 加载自定义知识库
   minimate --rebuild                               # 重建知识库索引
   minimate                                        # 交互模式（多轮对话）
@@ -527,9 +596,9 @@ def cli():
     parser.add_argument("question", nargs="?", default="", help="任务/问题（留空进入交互模式）")
     parser.add_argument(
         "--mode",
-        choices=["chat", "react", "plan"],
+        choices=["chat", "react", "plan", "multi"],
         default="react",
-        help="Agent 执行模式：chat=纯问答, react=ReAct 循环, plan=Plan&Execute",
+        help="Agent 执行模式：chat=纯问答, react=ReAct 循环, plan=Plan&Execute, multi=多 Agent 协作",
     )
     parser.add_argument("--kb-path", default="", help="知识库文档目录路径")
     parser.add_argument("--max-steps", type=int, default=8, help="ReAct 最大循环步数")

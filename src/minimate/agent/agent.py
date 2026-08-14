@@ -122,7 +122,9 @@ class Agent:
             if fc_system:
                 messages_fc.append({"role": "system", "content": fc_system})
             messages_fc.append({"role": "user", "content": user_msg})
-            return self._run_react_fc(messages_fc, loop_id)
+            answer = self._run_react_fc(messages_fc, loop_id)
+            self._maybe_extract_round_facts(messages_fc)
+            return answer
         except Exception as e:
             logger.warning("Function Calling 降级到文本协议：%s", e)
             print(_section("系统", f"Function Calling 不可用（{e}），降级到文本协议", fg="magenta"))
@@ -130,7 +132,17 @@ class Agent:
             if system:
                 messages_text.append({"role": "system", "content": system})
             messages_text.append({"role": "user", "content": user_msg})
-            return self._run_react_text(messages_text, loop_id)
+            answer = self._run_react_text(messages_text, loop_id)
+            self._maybe_extract_round_facts(messages_text)
+            return answer
+
+    def _maybe_extract_round_facts(self, messages: list[dict]):
+        """回合末提取：任务结束后从本轮消息提取长期记忆（每轮至多 1 次 LLM 调用）"""
+        if self.memory and hasattr(self.memory, "extract_facts_from_messages"):
+            try:
+                self.memory.extract_facts_from_messages(messages)
+            except Exception:
+                pass
 
     def _run_react_fc(self, messages: list[dict], loop_id: str) -> str:
         """Function Calling 通道：模型原生输出 tool_calls，零正则解析"""

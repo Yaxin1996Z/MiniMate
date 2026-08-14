@@ -39,6 +39,7 @@ class MemoryManager:
         )
         self.long_term = LongTermMemory(path=memory_path)
         self.project = project
+        self.repos: list[str] = []  # 已配置代码仓库名（用于检索时按仓库过滤）
         self.context_profile = ContextProfile(
             short_term_budget=token_budget,
             compression_trigger_ratio=trigger_ratio,
@@ -64,9 +65,14 @@ class MemoryManager:
         keywords: list[str] | None = None,
         scope: str = "project",
         source: str = "manual",
+        project: str | None = None,
     ):
-        self.long_term.add_fact(
-            content, keywords, scope=scope, project=self.project, source=source
+        return self.long_term.add_fact(
+            content,
+            keywords,
+            scope=scope,
+            project=project if project is not None else self.project,
+            source=source,
         )
 
     def add_summary(self, content: str):
@@ -97,7 +103,7 @@ class MemoryManager:
 
         # 1) 长期事实：有 query 按相关度检索（时间衰减），否则取最近 10 条
         if query:
-            facts = self.long_term.search(query, 5, project=self.project)
+            facts = self.long_term.search(query, 5, project=self._detect_repo(query))
         else:
             facts = self.long_term.get_visible(self.project)[-10:]
         if facts:
@@ -120,6 +126,18 @@ class MemoryManager:
             parts.append("【最近对话】\n" + conv)
 
         return "\n\n".join(parts)
+
+    def _detect_repo(self, query: str) -> str | None:
+        """查询中提到已配置仓库名时，按仓库过滤长期记忆（隔离生效）"""
+        q = (query or "").lower()
+        for repo in self.repos:
+            if repo.lower() in q:
+                return repo
+        return None
+
+    def set_repos(self, repo_names: list[str]):
+        """登记已配置代码仓库，检索时按仓库名隔离 project 级记忆"""
+        self.repos = [str(n) for n in (repo_names or []) if str(n).strip()]
 
     def get_report_context(self) -> str:
         """生成报告用上下文（事实 + 摘要，不带对话）"""
@@ -324,9 +342,64 @@ class MemoryManager:
         self.short_term.store(item)
         self._compress_if_needed()
 
-    def store_fact(self, fact: str, scope: str = "project", source: str = "manual"):
-        """存储关键事实到长期记忆"""
-        self.add_fact(fact, scope=scope, source=source)
+    def store_fact(
+        self,
+        fact: str,
+        scope: str = "project",
+        source: str = "manual",
+        project: str | None = None,
+    ):
+        """存储关键事实到长期记忆（project 可显式指定仓库名，默认当前项目）"""
+        return self.add_fact(fact, scope=scope, source=source, project=project)
+
+    def extract_facts_from_messages(self, messages: list[dict]) -> int:
+        """回合末 LLM 提取：从本轮对话/工具结果提取稳定事实（区分 global / repo），返回新增条数"""
+        import json
+        import re
+
+        texts = [
+            f"{m.get('role', '').upper()}: {m.get('content', '')}"
+            for m in messages
+            if m.get("role") in ("user", "assistant", "tool")
+            and (m.get("content") or "").strip()
+        ]
+        if not texts:
+            return 0
+        prompt = (
+            "从以下对话中提取值得长期记忆的稳定事实，区分两类：\n"
+            "- 用户偏好/习惯（跨项目）→ scope=global\n"
+            "- 项目/代码仓库信息 → scope=repo，并给出 repo 名（对话中提到时）\n"
+            "忽略临时任务、一次性指令、寒暄、过程性问答。\n"
+            "只输出 JSON 数组，每项格式："
+            '{"content": "事实", "scope": "global|repo", "repo": "仓库名或空"}\n\n'
+            + "\n".join(texts[-40:])
+        )
+        raw = llm.call(
+            prompt,
+            system="你是记忆提取助手，只输出 JSON。",
+            temperature=0.1,
+        )
+        if not raw or raw.startswith("[API 错误]"):
+            return 0
+        try:
+            m = re.search(r"\[.*?\]", raw, re.S)
+            facts = json.loads(m.group(0)) if m else []
+        except (json.JSONDecodeError, AttributeError):
+            return 0
+        if not isinstance(facts, list):
+            return 0
+        count = 0
+        for f in facts:
+            if not isinstance(f, dict):
+                continue
+            content = (f.get("content") or "").strip()
+            if len(content) < 4:
+                continue
+            scope = "global" if f.get("scope") == "global" else "project"
+            repo = (f.get("repo") or "").strip() or None
+            if self.store_fact(content, scope=scope, project=repo, source="agent"):
+                count += 1
+        return count
 
     def list_long_term(self) -> list[MemoryItem]:
         return self.long_term.get_all(None)
