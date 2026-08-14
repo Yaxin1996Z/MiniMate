@@ -1,7 +1,8 @@
 # MiniMate 🧠
 
 > **工作/代码助手 Agent** —— 输入一个问题或任务，MiniMate 按你选择的模式执行：
-> 纯问答（chat）一次调用直接回答，ReAct（react）带工具推理循环，Plan & Execute（plan）先规划再执行。
+> 纯问答（chat）一次调用直接回答，ReAct（react）带工具推理循环，Plan & Execute（plan）先规划再执行，
+> Multi-Agent（multi）规划者拆解、执行者并行干活、检查者验收的三角色协作。
 
 ---
 
@@ -10,18 +11,19 @@
 | 维度 | 说明 |
 |------|------|
 | **技术栈** | Python 3.12, DeepSeek API, Chroma RAG, FastAPI, Docker Compose |
-| **核心能力** | 三种 Agent 模式、ReAct 推理循环、Plan & Execute、工具调用、记忆、RAG 检索 |
-| **代码量** | 编排引擎、工具系统、记忆全部手写，零框架依赖 |
+| **核心能力** | 四种 Agent 模式（chat / react / plan / multi）、ReAct 推理循环、Multi-Agent 编排、工具调用、三层记忆、RAG 检索 |
+| **代码量** | 编排引擎、工具系统、记忆、多 Agent 协作全部手写，零框架依赖 |
 
 ---
 
-## 三种执行模式
+## 四种执行模式
 
 | 模式 | 执行方式 | 适用场景 |
 |------|---------|---------|
 | `chat` | 单次 LLM 调用，直接返回答案 | 快速问答、概念解释 |
 | `react` | Thought → Action → Observation → Final Answer 循环 | 需要工具计算/检索/搜索的任务 |
 | `plan` | 先生成结构化 JSON 计划 → 逐步执行 → 汇总最终答案 | 复杂任务拆解、多步骤工作流 |
+| `multi` | 规划者拆解 → 多 Worker 并行执行 → 检查者逐步骤验收 → 汇总 | 复杂任务且对结果质量有要求 |
 
 ```
 用户问题
@@ -32,8 +34,10 @@ Agent.run(mode)
    ├── react: Thought → Action → Observation → Final Answer
    │              │ 工具调用（走 ToolExecutor）
    │              ▼
-   │        web_search / calculator / save_file / query_knowledge
+   │        read_file / write_file / run_shell / web_search / search_code
    └── plan: 生成 JSON 计划 → 逐步执行（每步走 react 或 chat）→ 汇总
+
+   multi: 规划者拆步骤 → 执行者并行干活 → 检查者验收 → 汇总
 ```
 
 ### ReAct 循环
@@ -69,6 +73,39 @@ Observation: 工具返回结果 → 回到 Thought（循环）
 
 ---
 
+### Multi-Agent 协作
+
+把全能型 Agent 拆成三个专职角色，像项目团队一样分工协作、互相制衡。采用**主从架构（Orchestrator-SubAgent）**：编排器是"主"，负责任务分发与流程控制；子 Agent 是"从"，彼此不直接对话，所有消息都经编排器路由。
+
+| 角色 | 职责 | 是否调用工具 |
+|------|------|-------------|
+| **规划者（Planner）** | 把用户需求拆成 JSON 执行计划（id / 描述 / 类型 / 依赖） | 否 |
+| **执行者（Worker）** | 按步骤调用工具完成具体操作（唯一可调工具的角色） | 是 |
+| **检查者（Reviewer）** | 验收执行结果，通过放行 / 不通过打回重做 | 否 |
+
+**六阶段工作流：**
+
+```
+用户任务
+  │
+  ▼
+① 规划   规划者输出 JSON 计划
+② 解析   建模为 ExecutionStep，建立依赖 DAG（拓扑排序分层）
+③ 执行   同层无依赖步骤多 Worker 并行执行（线程池 + 轮询分配）
+④ 审查   检查者逐步骤验收，不通过注入问题清单重试（最多 2 次）
+⑤ 残留   依赖失败的步骤显式标记 SKIPPED，提示用户
+⑥ 汇总   按步骤顺序汇总结果，生成最终答案
+```
+
+关键设计：
+
+- **保守审批策略**：检查者输出无法解析（空内容 / 非 JSON / 缺 approved 字段）时默认"不通过"，宁可多审一次，不放过一个问题
+- **反馈重试闭环**：审查不通过时，把问题列表与改进建议注入执行者上下文重做，最多 2 次，超过后保留当前结果并提示人工复核
+- **依赖上下文注入**：执行某步骤前注入已完成依赖步骤的结果摘要（截断 500 字符），Worker 知道前一步干了什么又不会撑爆上下文
+- **每步干净状态**：每个子 Agent 独立对话历史，步骤完成后清空（保留系统提示词），避免上一步干扰下一步判断
+
+---
+
 ## 快速开始
 
 ### 1. 配置
@@ -96,6 +133,9 @@ minimate "计算 15*4 再减 3" --mode react
 # Plan & Execute
 minimate "对比 RAG 和微调方案" --mode plan
 
+# Multi-Agent 协作（规划者/执行者/检查者）
+minimate "重构工具注册模块" --mode multi
+
 # 交互模式（多轮对话，短期记忆）
 minimate
 
@@ -117,7 +157,7 @@ minimate --rebuild
 会话中可用命令：
 
 ```
-/mode <chat|react|plan>   切换执行模式
+/mode <chat|react|plan|multi>   切换执行模式
 /memory                   查看当前会话记忆
 /clear                    清空会话记忆
 /help                     显示帮助
@@ -210,11 +250,20 @@ cp config.example.json config.json
 ```
 MiniMate/
 ├── src/
-│   ├── cli.py                 # CLI 入口（三模式）
-│   ├── api.py                 # FastAPI 服务（三模式）
+│   ├── cli.py                 # CLI 入口（四模式）
+│   ├── api.py                 # FastAPI 服务
 │   └── minimate/
 │       ├── __init__.py           # 包定义
-│       ├── orchestrator.py       # Agent / Task / Crew + 三模式执行
+│       ├── orchestrator.py       # 兼容入口（re-export Agent / 计划 / 多 Agent）
+│       ├── agent/                # Agent 包（单 Agent + 多 Agent）
+│       │   ├── agent.py          # 单 Agent：chat / react / plan 三模式
+│       │   ├── task.py           # PlanTask + 计划解析 + DAG 拓扑排序
+│       │   ├── history_compactor.py  # LLM 消息历史压缩
+│       │   └── multi/            # 多 Agent 编排（主从架构 + 三角色）
+│       │       ├── role.py       # AgentRole 枚举（规划者/执行者/检查者）
+│       │       ├── message.py    # AgentMessage 六种消息类型
+│       │       ├── sub_agent.py  # SubAgent：独立角色 + 共享工具/记忆
+│       │       └── orchestrator.py  # 编排器：规划→执行→审查→汇总
 │       ├── tools/                # 工具系统包（按类分组注册）
 │       │   ├── core.py           # Tool / ToolExecutor / ReAct 解析
 │       │   ├── file_tools.py     # 文件工具（register_file_tools）
@@ -222,21 +271,22 @@ MiniMate/
 │       │   ├── web_tools.py      # 搜索工具（register_web_tools）
 │       │   ├── rag_tools.py      # 知识库工具（register_rag_tools）
 │       │   └── registry.py       # 注册中心（register_all_tools）
-│       ├── memory.py             # 三层记忆（Buffer / Entity / Findings）
-│       ├── llm.py                # LLM API 封装
-│       ├── config.py             # 配置模块（config.json 加载）
-│       ├── mcp/                  # MCP 包（stdio + http 双传输）
-│       │   ├── adapter.py        # McpToolAdapter：统一适配器 + 连接状态机
-│       │   ├── stdio.py          # stdio 传输（本地子进程）
-│       │   ├── http.py           # Streamable HTTP 传输（远程 URL）
-│       │   └── oauth.py          # OAuth 2.0（授权码 PKCE / 设备流 / 动态注册）
-│       └── rag/                  # RAG 知识库（Chroma + bge）
-│           ├── __init__.py
-│           ├── config.toml       # 模型路径、目录配置
-│           ├── knowledge.py      # 文档加载 + Chroma 检索
-│           └── repo/             # 知识库文档（.md/.txt，用户自放）
+│       ├── memory/               # 三层记忆（短期 / 长期 / 工具）
+│       │   ├── manager.py        # MemoryManager：四类记忆整合 + 上下文组装
+│       │   ├── short_term.py     # 短期：Token 预算淘汰 + Map-Reduce 压缩
+│       │   ├── long_term.py      # 长期：SQLite 持久化 + 去重 + 作用域
+│       │   ├── tool_memory.py    # 工具记忆：循环内重复调用检测
+│       │   ├── compressor.py     # Map-Reduce 压缩器 + LLM 事实提取
+│       │   └── token_budget.py   # Token 预算控制
+│       ├── llm/                  # LLM 统一调用（client / chat / stats）
+│       ├── mcp/                  # MCP 包（stdio + http 双传输 + OAuth）
+│       ├── coderag/              # 代码仓库 RAG（AST 索引 + BM25 + bge 向量）
+│       └── rag/                  # 文档知识库（Chroma + bge）
 ├── tests/
-│   └── test_react.py             # 单元测试（mock，无需 API）
+│   ├── test_cli.py               # CLI / 交互模式测试
+│   ├── test_multi.py             # 多 Agent 编排测试
+│   ├── test_react.py             # ReAct 循环测试
+│   └── test_memory.py            # 记忆系统测试
 ├── examples/
 │   └── mcp_demo_server.py        # 示例 MCP Server（FastMCP）
 │   └── mcp_http_server.py        # 示例远程 MCP Server（FastMCP HTTP）
@@ -261,36 +311,39 @@ MiniMate/
 | LangGraph | 状态机灵活 | 学习成本高、抽象层厚 |
 | **手写** | 完全可控、零依赖 | 需要造轮子 |
 
-### Agent / Task / Crew
+### Agent / Task / Multi-Agent Orchestrator
 
 | 概念 | 职责 |
 |------|------|
-| Agent | 角色 + 工具 + 记忆 + 执行模式（chat / react / plan） |
-| Task | 任务单元：描述 + 绑定 Agent + 模式 |
-| Crew | 任务调度器：顺序执行 + 上下文传递 |
+| Agent | 单 Agent：角色 + 工具 + 记忆 + 执行模式（chat / react / plan） |
+| Task（PlanTask） | 计划步骤建模：id / 目标 / 类型 / 依赖，DAG 拓扑排序 + 并行调度 |
+| MultiAgentOrchestrator | 多 Agent 编排：规划者拆解、执行者干活、检查者验收 |
 
 ### 记忆系统
 
 | 层次 | 作用 |
 |------|------|
-| Buffer | 短期对话缓存，CircularBuffer 自动丢弃 |
-| Entity | 实体提取（人名/术语/概念） |
-| Findings | 关键发现持久化，跨任务传递 |
+| 短期记忆 | 对话/工具结果按 Token 预算淘汰，90% 触发 Map-Reduce 压缩，保留最近 3 轮 |
+| 长期记忆 | 稳定事实 SQLite 持久化，归一化去重、关键词检索、global/仓库作用域隔离 |
+| 工具记忆 | 记录每次工具调用的参数/结果/耗时，支撑循环内重复调用检测与拦截 |
 
 ---
 
 ## 路线图
 
-- [x] 三种执行模式（chat / react / plan）
+- [x] 四种执行模式（chat / react / plan / multi）
 - [x] ReAct 推理-行动循环（Thought / Action / Observation + 完成判断）
 - [x] Plan & Execute（结构化计划 + 逐步执行 + 汇总）
+- [x] Multi-Agent 协作（规划者/执行者/检查者 + 并行执行 + 审查重试）
 - [x] 工具调用系统 + 按需装配
 - [x] Function Calling 工具调用（双通道：FC 优先 + 文本协议 fallback）
 - [x] MCP 协议化工具网关（本地工具 + MCP 远程工具共存）
 - [x] 代码助手工具（read_file / write_file / list_files / find_files / grep_files / run_shell）
 - [x] RAG 知识库（Chroma + bge 本地模型）
+- [x] Code RAG 代码仓库检索（AST 索引 + BM25 + bge-m3 向量混合检索）
+- [x] 长期记忆持久化（SQLite + 去重 + 关键词检索）
 - [ ] Skill 技能包系统
-- [ ] 长期记忆持久化 + 向量检索
+- [ ] 长期记忆向量检索
 
 ---
 
@@ -301,6 +354,7 @@ MiniMate/
 | Python 3.12 | 运行环境 |
 | DeepSeek API | LLM 推理 |
 | Chroma + bge-small-zh | RAG 知识库向量检索 |
+| bge-m3 + BM25 + RRF | Code RAG 混合检索（代码仓库） |
 | FastAPI + Uvicorn | REST API 服务 |
 | Docker / Compose | 容器化部署 |
-| 零框架依赖 | 编排引擎、工具、记忆全部手写 |
+| 零框架依赖 | 编排引擎、工具、记忆、多 Agent 协作全部手写 |
