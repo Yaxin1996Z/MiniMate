@@ -13,6 +13,7 @@ from .core import MemoryItem, estimate_tokens, score_relevance
 from .short_term import ShortTermMemory
 from .long_term import LongTermMemory
 from .compressor import MapReduceCompressor
+from .. import llm
 
 
 class MemoryManager:
@@ -41,9 +42,10 @@ class MemoryManager:
 
     def add_conversation(self, role: str, content: str):
         self.short_term.add(MemoryItem(type="conversation", role=role, content=content))
-        # 从对话提取潜在事实（简单的用户偏好/项目信息句式）
-        self._auto_extract_fact(content)
-        self._extract_explicit_memory(content)
+        # 从对话提取潜在事实（仅用户消息，避免把助手复述/反问也当成事实）
+        if role == "user":
+            self._auto_extract_fact(content)
+            self._extract_explicit_memory(content)
         self._compress_if_needed()
 
     def add_fact(
@@ -51,8 +53,11 @@ class MemoryManager:
         content: str,
         keywords: list[str] | None = None,
         scope: str = "project",
+        source: str = "manual",
     ):
-        self.long_term.add_fact(content, keywords, scope=scope, project=self.project)
+        self.long_term.add_fact(
+            content, keywords, scope=scope, project=self.project, source=source
+        )
 
     def add_summary(self, content: str):
         self.short_term._summaries.append(content)
@@ -151,31 +156,125 @@ class MemoryManager:
         return self.long_term.search(query, limit, project=self.project)
 
     def _compress_if_needed(self):
-        """短期记忆达到 trigger_ratio 时触发压缩"""
+        """短期记忆达到 trigger_ratio 时触发压缩；淘汰前先用 LLM 提取可长期记忆的事实"""
         if self.short_term.needs_compression():
-            self.short_term.compress_old(self.compressor, keep_recent_rounds=3)
+            self.short_term.compress_old(
+                self.compressor,
+                keep_recent_rounds=3,
+                on_evict=self._llm_extract_facts,
+            )
+
+    def _llm_extract_facts(self, items: list[MemoryItem]) -> None:
+        """压缩淘汰前，用 LLM 从旧条目中提取稳定事实写入长期记忆
+
+        参考 paicli ContextCompressor.extractFacts：
+        结构化提示词 + 每行一条事实 + 启发式后过滤（临时请求/猜测拦截，持久线索放行）。
+        """
+        texts = [
+            f"{i.role.upper()}({i.type}): {i.content}"
+            for i in items
+            if (i.content or "").strip()
+        ]
+        if not texts:
+            return
+        prompt = self._EXTRACT_FACTS_PROMPT % "\n\n".join(texts)
+        raw = llm.call(
+            prompt,
+            system="你是一个信息提取助手，只输出关键事实，不输出其他内容。",
+            temperature=0.1,
+        )
+        if not raw or raw.startswith("[API 错误]"):
+            return
+        for line in raw.splitlines():
+            fact = self._normalize_fact_line(line)
+            if self._is_persistent_fact(fact):
+                self.long_term.add_fact(
+                    fact, scope="project", project=self.project, source="llm"
+                )
+
+    _EXTRACT_FACTS_PROMPT = (
+        "请从以下对话中提取\"跨会话仍然成立、未来复用仍有价值\"的稳定事实，"
+        "格式为每行一条：\n"
+        "- 用户偏好和习惯\n"
+        "- 项目信息（名称、路径、技术栈）\n"
+        "- 重要决策和约定\n\n"
+        "只保留用户明确说明、或工具/代码库可验证的信息。\n"
+        "绝对不要提取以下内容：\n"
+        "- 当前这一轮让你执行的临时任务、步骤、todo\n"
+        "- 一次性的文件名、目录名、输出要求\n"
+        "- 模型自己的猜测、纠错、提醒、推断\n"
+        "- \"用户想要/需要/让我/请你...\" 这类请求句\n\n"
+        "对话内容：\n%s\n\n"
+        "请每行一条事实，不要多余解释。"
+    )
+
+    _EPHEMERAL_FACT_PREFIXES = (
+        "用户想", "用户要", "用户需要", "用户请求", "帮我", "让我",
+        "新建", "创建", "删除", "修改", "生成", "补充要求", "当前这一轮", "本次任务",
+    )
+
+    _SPECULATION_CUES = ("可能", "应该", "猜测", "推测", "笔误", "提醒")
+
+    _DURABLE_FACT_HINTS = (
+        "用户偏好", "用户习惯", "喜欢", "倾向", "项目", "仓库", "路径", "技术栈",
+        "版本", "模型", "接口", "配置", "环境变量", "命令", "约定", "规则", "默认",
+    )
+
+    @staticmethod
+    def _normalize_fact_line(line: str) -> str:
+        """去掉行首 "- " / "• " 项目符号并去除首尾空白"""
+        fact = (line or "").strip()
+        if fact.startswith("- "):
+            fact = fact[2:]
+        elif fact.startswith("• "):
+            fact = fact[2:]
+        return fact.strip()
+
+    @staticmethod
+    def _is_persistent_fact(fact: str) -> bool:
+        """启发式过滤：太短/临时请求/猜测句不存；带标签或含持久线索的才存"""
+        if len(fact) <= 5:
+            return False
+        normalized = fact.lower()
+        if any(
+            normalized.startswith(p)
+            for p in MemoryManager._EPHEMERAL_FACT_PREFIXES
+        ):
+            return False
+        if any(c in normalized for c in MemoryManager._SPECULATION_CUES):
+            return False
+        if "：" in normalized or ":" in normalized:
+            return True
+        return any(h in normalized for h in MemoryManager._DURABLE_FACT_HINTS)
 
     # ----------------------------------------------------------
     # 简单事实自动提取（用户偏好/项目信息）
     # ----------------------------------------------------------
 
     _FACT_PATTERNS = (
-        (r"我(?:是|叫|喜欢|偏好|希望|想用)(.{1,40}?)(?:[。！!？?]|$)", "用户偏好"),
-        (r"项目(?:是|使用|采用|基于)(.{1,50}?)(?:[。！!？?]|$)", "项目信息"),
+        (r"我(?:的|家)?((?:[^，。！!？?]{0,10}?)(?:叫|是|喜欢|偏好|希望|想用)(.{1,40}?))(?:[，。！!？?]|$)", "用户偏好"),
+        (r"项目(?:是|叫|使用|采用|基于)(.{1,50}?)(?:[。！!？?]|$)", "项目信息"),
     )
 
     _REMEMBER_PATTERNS = (
-        r"(?:记住|记一下|记下来|以后记得|下次记得|保存(?:这个)?偏好)"
-        r"(?:[:：]?\s*)(.{1,60}?)(?:[。！!？?]|$)",
+        r"(?:记住了|记住|记一下|记下来|以后记得|下次记得|保存(?:这个)?偏好)"
+        r"(?:[:：！!？?，,\s]*)(.{1,60}?)(?:[。！!？?]|$)",
     )
 
     def _auto_extract_fact(self, content: str):
         import re
 
+        # 疑问句不提取（什么/怎么/吗/呢/哪/谁/几/多少 或带问号）
+        if re.search(r"[？?]|什么|怎么|哪|谁|吗|呢|几|多少", content):
+            return
+
         for pattern, tag in self._FACT_PATTERNS:
             m = re.search(pattern, content)
-            if m and len(m.group(1).strip()) >= 4:
-                self.long_term.add_fact(f"{tag}：{m.group(1).strip()}")
+            if not m:
+                continue
+            fact = re.sub(r"[，。！!？?\s]+$", "", m.group(0)).strip()
+            if len(fact) >= 4:
+                self.long_term.add_fact(f"{tag}：{fact}", source="agent")
 
     def _extract_explicit_memory(self, content: str):
         """显式记忆指令：'记住/记一下/以后记得...' → 存入长期（global 跨项目）"""

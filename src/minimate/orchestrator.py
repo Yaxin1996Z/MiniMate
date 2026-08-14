@@ -116,7 +116,7 @@ class Agent:
         task_preview = task[:50] + ("..." if len(task) > 50 else "")
         print(_section(
             "系统",
-            f"进入 ReAct 循环（任务：{task_preview}，最多 {self.max_steps} 步）",
+            f"进入 ReAct 循环（任务：{task_preview}，最多 {self.max_steps} 轮）",
             fg="magenta",
         ))
 
@@ -150,6 +150,19 @@ class Agent:
             tool_calls = result["tool_calls"]
 
             if tool_calls:
+                # 一次声明本轮全部工具调用（Function Calling 契约：一条 assistant 消息 + N 条 tool 结果）
+                messages.append({
+                    "role": "assistant",
+                    "content": result["content"] or "",
+                    "tool_calls": [
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                        }
+                        for tc in tool_calls
+                    ],
+                })
                 for tc in tool_calls:
                     name = tc["name"]
                     try:
@@ -157,7 +170,7 @@ class Agent:
                     except json.JSONDecodeError:
                         args = {}
                     print(_section(
-                        f"工具调用（第 {step} 步）",
+                        f"React循环第 {step} 轮 工具调用",
                         f"工具：{name}\n参数：{json.dumps(args, ensure_ascii=False)}",
                         fg="cyan",
                     ))
@@ -168,16 +181,6 @@ class Agent:
                         observation = self.tools.execute(name, **args)
                     print(_section("工具返回", truncate(observation, 1000), fg="magenta"))
 
-                    # 消息回填：assistant 必须带原始 tool_calls，结果以 tool 角色返回
-                    messages.append({
-                        "role": "assistant",
-                        "content": result["content"] or "",
-                        "tool_calls": [{
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {"name": tc["name"], "arguments": tc["arguments"]},
-                        }],
-                    })
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
@@ -188,16 +191,33 @@ class Agent:
             # 无工具调用：content 即最终回答
             content = (result["content"] or "").strip()
             if content:
-                print(_section(f"助手回答（第 {step} 步）", content, fg="green"))
+                print(_section(f"React循环第 {step} 轮, 无工具调用 助手回答", content, fg="green"))
                 return content
             last_content = content
 
+        # 步数耗尽仍未给出最终答案：强制收尾（移除工具 + 追加提示，确保有输出）
         print(_section(
-            "助手回答",
-            f"（达到最大步数 {self.max_steps}，返回最后输出）\n{last_content or '(无输出)'}",
-            fg="green",
+            "系统",
+            f"已达最大轮数 {self.max_steps}，强制生成最终答案…",
+            fg="magenta",
         ))
-        logger.warning("ReAct 达到最大步数 %d 未完成（FC 通道）", self.max_steps)
+        messages.append({
+            "role": "user",
+            "content": (
+                "（提示：工具调用次数已用完，你无法再调用工具）"
+                "请基于以上所有工具结果和对话内容，直接给出最终答案，"
+                "不要再尝试调用工具。"
+            ),
+        })
+        final = llm.chat_tools(messages, tools=[])
+        content = (final.get("content") or "").strip()
+        if content:
+            print(_section("助手回答", content, fg="green"))
+            return content
+        logger.warning(
+            "ReAct 达到最大步数 %d 未完成（FC 通道），强制收尾亦无输出",
+            self.max_steps,
+        )
         return last_content
 
     def _run_react_text(self, messages: list[dict], recent_calls: list[tuple[str, str]]) -> str:
@@ -244,7 +264,15 @@ class Agent:
             ))
             return last_output.strip()
 
-        # 达到最大步数仍未完成：返回最后输出，并明确告知
+        # 达到最大步数仍未完成：强制收尾（要求直接给出最终答案）
+        messages.append({
+            "role": "user",
+            "content": "（提示：轮次已用完）请基于以上信息直接给出最终答案，不要再输出 Thought/Action。",
+        })
+        final = llm.chat(messages)
+        if final.strip() and not final.startswith("[API 错误]"):
+            print(_section("助手回答", final.strip(), fg="green"))
+            return final.strip()
         print(_section(
             "助手回答",
             f"（达到最大步数 {self.max_steps}，返回最后输出）\n{last_output.strip()}",

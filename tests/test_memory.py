@@ -55,6 +55,43 @@ class LongTermMemoryTest(unittest.TestCase):
         self.assertFalse(mem.add_fact("用户偏好：喜欢 Python"))  # 重复跳过
         self.assertEqual(len(mem.items), 1)
 
+    def test_deduplicate_normalized(self):
+        """标点/大小写差异视为重复：'喜欢 Python。' 与 '喜欢Python' 只存一条"""
+        mem = LongTermMemory(path=self.path)
+        self.assertTrue(mem.add_fact("用户偏好：喜欢 Python。"))
+        self.assertFalse(mem.add_fact("用户偏好：喜欢Python"))
+        self.assertEqual(len(mem.items), 1)
+
+    def test_deduplicate_cross_prefix(self):
+        """不同前缀但归一化后相同视为重复：显式/自动提取的同一条事实只存一条"""
+        mem = LongTermMemory(path=self.path)
+        self.assertTrue(mem.add_fact("用户偏好：五月"))
+        self.assertFalse(mem.add_fact("用户偏好（显式）：五月"))
+        self.assertEqual(len(mem.items), 1)
+
+    def test_existing_rows_normalized_on_load(self):
+        """存量数据按原始哈希入库后，新实例启动时重哈希并合并重复"""
+        import hashlib
+        import sqlite3
+
+        mem = LongTermMemory(path=self.path)
+        conn = sqlite3.connect(self.path)
+        for content in ("用户偏好：五月", "用户偏好（显式）：五月"):
+            raw_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            conn.execute(
+                """
+                INSERT INTO memories
+                    (scope, content, created_at, kind, source, updated_at, content_hash)
+                VALUES ('', ?, '2026-01-01T00:00:00+00:00', 'fact', 'manual', '', ?)
+                """,
+                (content, raw_hash),
+            )
+        conn.commit()
+        conn.close()
+
+        mem2 = LongTermMemory(path=self.path)  # 触发归一化重哈希 + 去重
+        self.assertEqual(len(mem2.items), 1)
+
     def test_keyword_search(self):
         mem = LongTermMemory(path=self.path)
         mem.add_fact("用户偏好：喜欢 Python 和 FastAPI", keywords=["Python", "FastAPI"])
@@ -71,6 +108,40 @@ class LongTermMemoryTest(unittest.TestCase):
         mem2 = LongTermMemory(path=self.path)
         self.assertEqual(len(mem2.items), 1)
         self.assertIn("AI Agent", mem2.items[0].content)
+
+    def test_sqlite_schema_and_access_count(self):
+        """SQLite 表结构对齐 PaiCLI memories 设计；检索命中递增 access_count"""
+        import sqlite3
+
+        mem = LongTermMemory(path=self.path)
+        self.assertTrue(mem.add_fact("用户家的猫咪名叫五月", source="agent"))
+
+        conn = sqlite3.connect(self.path)
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(memories)")}
+            expected = {
+                "id", "scope", "content", "created_at", "kind", "source",
+                "importance", "confidence", "updated_at", "expires_at",
+                "access_count", "content_hash",
+            }
+            self.assertTrue(expected.issubset(cols))
+            row = conn.execute(
+                "SELECT scope, source, content_hash FROM memories"
+            ).fetchone()
+            self.assertEqual(row[0], "")      # 无项目时为 project 作用域（空串）
+            self.assertEqual(row[1], "agent")
+            self.assertEqual(len(row[2]), 64)  # sha256 hex
+        finally:
+            conn.close()
+
+        mem.search("五月")  # 命中一次
+        conn = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT access_count FROM memories").fetchone()[0], 1
+            )
+        finally:
+            conn.close()
 
 
 class CompressorTest(unittest.TestCase):
@@ -124,6 +195,25 @@ class MemoryManagerTest(unittest.TestCase):
         facts = mem.long_term.items
         self.assertTrue(any("用户偏好" in f.content for f in facts))
 
+    def test_auto_extract_fact_with_owner(self):
+        """带所有格/主语的句子也能提取，且保留上下文（小猫咪叫五月）"""
+        mem = MemoryManager(memory_path=self.path)
+        mem.add_user_message("我家小猫咪叫五月")
+        facts = mem.long_term.items
+        self.assertTrue(any("小猫咪叫五月" in f.content for f in facts))
+
+    def test_question_not_extracted_as_fact(self):
+        """疑问句不提取：'我家猫咪叫什么' 不应入库成为事实"""
+        mem = MemoryManager(memory_path=self.path)
+        mem.add_user_message("我家猫咪叫什么")
+        self.assertFalse(any("什么" in f.content for f in mem.long_term.items))
+
+    def test_ai_reply_not_auto_extracted(self):
+        """助手复述/反问不自动提取事实"""
+        mem = MemoryManager(memory_path=self.path)
+        mem.add_ai_message("好的，我喜欢Python和FastAPI。")
+        self.assertEqual(len(mem.long_term.items), 0)
+
     def test_save_load_facts(self):
         mem = MemoryManager(memory_path=self.path)
         mem.add_fact("用户偏好：工作地点上海")
@@ -139,6 +229,32 @@ class MemoryManagerTest(unittest.TestCase):
             mem.add_ai_message(f"第 {i} 轮回答")
         ctx = mem.get_context()
         self.assertLessEqual(estimate_tokens(ctx), 100 * 2)  # 有节流余量
+
+    def test_llm_fact_extraction_on_compress(self):
+        """压缩触发时，用 LLM 从旧条目提取事实写入长期记忆（正则之外的补充通道）"""
+        mem = MemoryManager(memory_path=self.path, token_budget=600, trigger_ratio=0.5)
+
+        def fake_llm_call(prompt, system="", temperature=0):
+            return (
+                "用户偏好：我每天工作到十点\n"
+                "帮我写一个二分查找脚本\n"      # 临时请求，应被启发式过滤
+                "项目技术栈：FastAPI"
+            )
+
+        with patch("minimate.memory.manager.llm.call", side_effect=fake_llm_call):
+            for i in range(10):
+                mem.add_user_message(f"第{i}轮：讨论技术方案细节内容信息" * 3)
+                mem.add_ai_message(f"第{i}轮回答：确认方案可行" * 3)
+
+        self.assertTrue(
+            any("工作到十点" in f.content for f in mem.long_term.items)
+        )
+        self.assertTrue(
+            any("FastAPI" in f.content for f in mem.long_term.items)
+        )
+        self.assertFalse(
+            any("二分查找" in f.content for f in mem.long_term.items)
+        )
 
 
 class ProjectScopeTest(unittest.TestCase):
@@ -174,6 +290,13 @@ class ProjectScopeTest(unittest.TestCase):
         old = MemoryItem(type="fact", content="旧事实：Python 语言", timestamp=time.time() - 48 * 3600)
         new = MemoryItem(type="fact", content="新事实：Python 语言", timestamp=time.time())
         self.assertGreater(score_relevance(new, "Python 开发"), score_relevance(old, "Python 开发"))
+
+    def test_chinese_bigram_scoring(self):
+        """中文双字切分：'我家猫咪叫什么' 能命中 '我家猫咪叫五月'"""
+        from minimate.memory import MemoryItem, score_relevance
+
+        item = MemoryItem(type="fact", content="用户偏好：我家猫咪叫五月")
+        self.assertGreater(score_relevance(item, "我家猫咪叫什么"), 0)
 
 
 class CompressionTriggerTest(unittest.TestCase):
@@ -217,6 +340,27 @@ class ExplicitMemoryTest(unittest.TestCase):
         mem.add_user_message("记住我的工作地点在上海")
         facts = mem.long_term.items
         self.assertTrue(any("上海" in f.content and f.metadata.get("scope") == "global" for f in facts))
+
+    def test_explicit_remember_with_le(self):
+        """"记住了X"也能正确提取，不把"了"吞进事实内容"""
+        mem = MemoryManager(memory_path=self.path)
+        mem.add_user_message("记住了MiniMate项目的完整信息")
+        facts = mem.long_term.items
+        self.assertTrue(
+            any(
+                "MiniMate项目的完整信息" in f.content
+                and "了MiniMate" not in f.content
+                for f in facts
+            )
+        )
+
+    def test_ai_reply_not_treated_as_remember_command(self):
+        """助手复述"我记住了"不应被当成显式记忆指令"""
+        mem = MemoryManager(memory_path=self.path)
+        mem.add_user_message("我家猫咪叫五月")
+        mem.add_ai_message("好的，我记住了！你家猫咪叫五月，名字真好听。")
+        facts = mem.long_term.items
+        self.assertFalse(any("（显式）" in f.content for f in facts))
 
 
 if __name__ == "__main__":

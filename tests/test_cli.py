@@ -5,7 +5,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from cli import interactive
+from cli import _display_width, _input_windows, interactive
 
 
 class InteractiveTest(unittest.TestCase):
@@ -19,7 +19,7 @@ class InteractiveTest(unittest.TestCase):
     def tearDown(self):
         self.mcp_patcher.stop()
 
-    @patch("builtins.input", side_effect=["/quit"])
+    @patch("cli._input_line", side_effect=["/quit"])
     def test_quit_clears_session(self, mock_input):
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -28,7 +28,7 @@ class InteractiveTest(unittest.TestCase):
         self.assertIn("MiniMate v", out)          # logo + 版本
         self.assertIn("再见！会话记忆已清除", out)   # 退出提示
 
-    @patch("builtins.input", side_effect=KeyboardInterrupt())
+    @patch("cli._input_line", side_effect=KeyboardInterrupt())
     def test_ctrl_c_exits_cleanly(self, mock_input):
         """Ctrl+C 不抛异常，正常退出并提示记忆清除"""
         buf = io.StringIO()
@@ -36,7 +36,7 @@ class InteractiveTest(unittest.TestCase):
             interactive()
         self.assertIn("再见！会话记忆已清除", buf.getvalue())
 
-    @patch("builtins.input", side_effect=["/mode bad", "/mode plan", "/quit"])
+    @patch("cli._input_line", side_effect=["/mode bad", "/mode plan", "/quit"])
     def test_mode_command(self, mock_input):
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -45,7 +45,7 @@ class InteractiveTest(unittest.TestCase):
         self.assertIn("用法：/mode chat|react|plan", out)
         self.assertIn("已切换到 plan 模式", out)
 
-    @patch("builtins.input", side_effect=["/clear", "/memory", "/quit"])
+    @patch("cli._input_line", side_effect=["/clear", "/memory", "/quit"])
     def test_clear_and_memory(self, mock_input):
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -53,6 +53,58 @@ class InteractiveTest(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("会话记忆已清空", out)
         self.assertIn("记忆统计", out)  # /memory 显示统计报告
+
+    @patch("cli._input_line", side_effect=EOFError())
+    def test_eof_exits_cleanly(self, mock_input):
+        """Ctrl+Z（EOF）正常退出并提示记忆清除"""
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            interactive()
+        self.assertIn("再见！会话记忆已清除", buf.getvalue())
+
+
+class InputHistoryTest(unittest.TestCase):
+    """Windows 自绘输入的 ↑/↓ 历史导航与基础编辑"""
+
+    def _run(self, keys, history=None):
+        import msvcrt
+
+        with patch.object(msvcrt, "getwch", side_effect=keys), patch(
+            "sys.stdout", new_callable=io.StringIO
+        ):
+            return _input_windows(history or [], "> ")
+
+    def test_arrow_up_loads_history(self):
+        self.assertEqual(self._run(["\x00", "H", "\r"], ["hello"]), "hello")
+
+    def test_arrow_down_restores_draft(self):
+        result = self._run(["x", "\x00", "H", "\x00", "P", "\r"], ["hello"])
+        self.assertEqual(result, "x")
+
+    def test_backspace_edits_line(self):
+        self.assertEqual(self._run(["a", "b", "\x08", "\r"]), "a")
+
+    def test_left_right_moves_cursor(self):
+        # 输入 ab → ← → 插入 c → Enter
+        self.assertEqual(self._run(["a", "b", "\x00", "K", "c", "\r"]), "acb")
+
+    def test_display_width_counts_cjk_double(self):
+        self.assertEqual(_display_width("我家猫咪叫五月"), 14)
+        self.assertEqual(_display_width("/memory"), 7)
+        self.assertEqual(_display_width("abc"), 3)
+
+    def test_down_clears_wide_char_leftover(self):
+        """从中文行切到 ASCII 行时按终端列宽补空格，避免残留字符（如 '/memory 叫五月'）"""
+        import msvcrt
+
+        keys = ["\x00", "H", "\x00", "H", "\x00", "P", "\x00", "P", "\r"]
+        out = io.StringIO()
+        with patch.object(msvcrt, "getwch", side_effect=keys), patch("sys.stdout", out):
+            result = _input_windows(["/memory", "我家猫咪叫五月"], "> ")
+        self.assertEqual(result, "")
+        text = out.getvalue()
+        self.assertIn("> /memory" + " " * 7 + "\r> /memory", text)
+        self.assertIn("> " + " " * 14 + "\r> ", text)
 
 
 if __name__ == "__main__":

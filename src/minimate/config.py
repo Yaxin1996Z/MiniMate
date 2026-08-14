@@ -12,6 +12,44 @@ import os
 from typing import Any
 
 
+def _strip_json_comments(text: str) -> str:
+    """移除 JSON 中的 // 行注释与 /* */ 块注释（字符串内的 // 不受影响）。"""
+    out: list[str] = []
+    i, n = 0, len(text)
+    in_string = False
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if in_string:
+            out.append(ch)
+            if ch == "\\" and nxt:
+                out.append(nxt)
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i = min(i + 2, n)
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _config_path() -> str:
     """项目根目录下的 config.json"""
     return os.path.join(os.path.dirname(__file__), "..", "..", "config.json")
@@ -43,11 +81,11 @@ def load_config(path: str = "") -> dict:
         return cfg
     try:
         with open(file, "r", encoding="utf-8") as f:
-            user = json.load(f)
+            user = json.loads(_strip_json_comments(f.read()))
         if isinstance(user, dict):
             cfg = _deep_merge(cfg, user)
     except (json.JSONDecodeError, OSError) as e:
-        print(f"  ⚠️ config.json 解析失败（{e}），使用默认配置")
+        print(f"  config.json 解析失败（{e}），使用默认配置")
     return cfg
 
 

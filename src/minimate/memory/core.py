@@ -39,7 +39,11 @@ class MemoryItem:
 
 
 def score_relevance(item: "MemoryItem", query: str) -> float:
-    """相关度评分：精确匹配 1.0 + 关键词命中比例 × 时间衰减（24h 内 1.0→0.5）"""
+    """相关度评分：精确匹配 1.0 + 关键词命中比例 × 时间衰减（24h 内 1.0→0.5）
+
+    中文连续串切成重叠双字（如"我家猫咪叫什么" → 我家/家猫/猫咪/咪叫/叫什/什么），
+    避免贪心整段切分导致"什么"这类词匹配不上。
+    """
     if not query:
         return 0.0
     content = item.content or ""
@@ -49,7 +53,9 @@ def score_relevance(item: "MemoryItem", query: str) -> float:
 
     import re
 
-    q_words = re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}|[\u4e00-\u9fff]{2,6}", q)
+    q_words = re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", q)
+    for run in re.findall(r"[\u4e00-\u9fff]+", q):
+        q_words.extend(run[i : i + 2] for i in range(len(run) - 1))
     if not q_words:
         return 0.0
     matched = sum(1 for w in q_words if w in content)

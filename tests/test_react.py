@@ -133,14 +133,53 @@ class AgentReactLoopTest(unittest.TestCase):
         self.assertIn("结果[q1]", last["content"])
 
     @patch("minimate.orchestrator.llm.chat_tools")
+    def test_multiple_tool_calls_single_assistant_message(self, mock_chat_tools):
+        """一次返回多个 tool_calls：只回填一条 assistant（含全部调用）+ 每条结果一个 tool 消息"""
+        mock_chat_tools.side_effect = [
+            {
+                "content": "两个工具",
+                "tool_calls": [
+                    {"id": "call_1", "name": "fake_tool", "arguments": '{"args": "q1"}'},
+                    {"id": "call_2", "name": "fake_tool", "arguments": '{"args": "q2"}'},
+                ],
+            },
+            {"content": "最终答案", "tool_calls": []},
+        ]
+        agent = _make_agent()
+        result = agent.run("并行调用测试")
+
+        self.assertEqual(result, "最终答案")
+        second_call_messages = mock_chat_tools.call_args_list[1].args[0]
+        assistant_msgs = [m for m in second_call_messages if m["role"] == "assistant"]
+        self.assertEqual(len(assistant_msgs), 1)
+        self.assertEqual(len(assistant_msgs[0]["tool_calls"]), 2)
+        tool_msgs = [m for m in second_call_messages if m["role"] == "tool"]
+        self.assertEqual(len(tool_msgs), 2)
+        self.assertEqual({m["tool_call_id"] for m in tool_msgs}, {"call_1", "call_2"})
+
+    @patch("minimate.orchestrator.llm.chat_tools")
     def test_stops_at_max_steps(self, mock_chat_tools):
-        """模型一直调工具不结束 → 达到 max_steps 强制停止"""
+        """模型一直调工具不结束 → 达到 max_steps 后追加一次强制收尾调用"""
         mock_chat_tools.return_value = {"content": "", "tool_calls": [self._fc_call()]}
         agent = _make_agent(max_steps=3)
         result = agent.run("测试任务")
 
-        self.assertEqual(mock_chat_tools.call_count, 3)
+        self.assertEqual(mock_chat_tools.call_count, 4)  # 3 轮工具 + 1 次强制收尾
         self.assertEqual(result, "")
+
+    @patch("minimate.orchestrator.llm.chat_tools")
+    def test_forced_final_answer_at_max_steps(self, mock_chat_tools):
+        """步数耗尽后强制收尾：最后一次调用给出答案则返回，而不是 (无输出)"""
+        mock_chat_tools.side_effect = [
+            {"content": "", "tool_calls": [self._fc_call()]},
+            {"content": "", "tool_calls": [self._fc_call()]},
+            {"content": "最终答案", "tool_calls": []},
+        ]
+        agent = _make_agent(max_steps=2)
+        result = agent.run("测试任务")
+
+        self.assertEqual(result, "最终答案")
+        self.assertEqual(mock_chat_tools.call_count, 3)
 
     @patch("minimate.orchestrator.llm.chat_tools")
     def test_direct_content_is_final(self, mock_chat_tools):

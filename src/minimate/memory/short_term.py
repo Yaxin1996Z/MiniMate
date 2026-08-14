@@ -42,13 +42,24 @@ class ShortTermMemory:
             and len(self._items) > 8
         )
 
-    def compress_old(self, compressor, keep_recent_rounds: int = 3) -> bool:
-        """压缩旧条目（保留最近 N 轮完整消息），注入摘要"""
+    def compress_old(
+        self,
+        compressor,
+        keep_recent_rounds: int = 3,
+        on_evict=None,
+    ) -> bool:
+        """压缩旧条目（保留最近 N 轮完整消息），注入摘要。
+
+        on_evict：可选回调，在旧条目被丢弃前收到待淘汰列表（用于事实提取等）。
+        """
         keep_count = keep_recent_rounds * 2
         if len(self._items) <= keep_count + 2:
             return False
         old = self._items[:-keep_count]
         recent = self._items[-keep_count:]
+
+        if on_evict:
+            on_evict(old)
 
         summary = compressor.compress(old)
         if not summary:
