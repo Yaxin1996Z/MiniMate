@@ -9,10 +9,14 @@
 上下文组装顺序：长期事实 → 历史摘要 → 短期对话（按预算截断）
 """
 
+import os
+
 from .core import MemoryItem, estimate_tokens, score_relevance
 from .short_term import ShortTermMemory
 from .long_term import LongTermMemory
+from .tool_memory import ToolMemory
 from .compressor import MapReduceCompressor
+from .token_budget import ContextProfile, TokenBudget
 from .. import llm
 
 
@@ -35,13 +39,19 @@ class MemoryManager:
         )
         self.long_term = LongTermMemory(path=memory_path)
         self.project = project
+        self.context_profile = ContextProfile(
+            short_term_budget=token_budget,
+            compression_trigger_ratio=trigger_ratio,
+        )
+        self.token_budget_control = TokenBudget(self.context_profile.max_context_window)
+        self.tool_memory = ToolMemory()
 
     # ----------------------------------------------------------
     # 四种记忆写入
     # ----------------------------------------------------------
 
     def add_conversation(self, role: str, content: str):
-        self.short_term.add(MemoryItem(type="conversation", role=role, content=content))
+        self.short_term.store(MemoryItem(type="conversation", role=role, content=content))
         # 从对话提取潜在事实（仅用户消息，避免把助手复述/反问也当成事实）
         if role == "user":
             self._auto_extract_fact(content)
@@ -62,12 +72,8 @@ class MemoryManager:
     def add_summary(self, content: str):
         self.short_term._summaries.append(content)
 
-    def add_tool_result(self, content: str):
-        self.short_term.add(MemoryItem(type="tool_result", role="tool", content=content))
-        self._compress_if_needed()
-
     # ----------------------------------------------------------
-    # 兼容接口（原 ResearchMemory）
+    # 常用写入接口
     # ----------------------------------------------------------
 
     def add_user_message(self, content: str):
@@ -75,9 +81,6 @@ class MemoryManager:
 
     def add_ai_message(self, content: str):
         self.add_conversation("assistant", content)
-
-    def add_finding(self, content: str):
-        self.add_fact(content)
 
     # ----------------------------------------------------------
     # 上下文组装（Token 预算控制）
@@ -155,19 +158,19 @@ class MemoryManager:
         """长期事实关键词检索"""
         return self.long_term.search(query, limit, project=self.project)
 
-    def _compress_if_needed(self):
+    def _compress_if_needed(self) -> bool:
         """短期记忆达到 trigger_ratio 时触发压缩；淘汰前先用 LLM 提取可长期记忆的事实"""
         if self.short_term.needs_compression():
-            self.short_term.compress_old(
+            return self.short_term.compress_old(
                 self.compressor,
                 keep_recent_rounds=3,
                 on_evict=self._llm_extract_facts,
             )
+        return False
 
     def _llm_extract_facts(self, items: list[MemoryItem]) -> None:
         """压缩淘汰前，用 LLM 从旧条目中提取稳定事实写入长期记忆
 
-        参考 paicli ContextCompressor.extractFacts：
         结构化提示词 + 每行一条事实 + 启发式后过滤（临时请求/猜测拦截，持久线索放行）。
         """
         texts = [
@@ -284,6 +287,88 @@ class MemoryManager:
         if m and len(m.group(1).strip()) >= 3:
             self.add_fact("用户偏好（显式）：" + m.group(1).strip(), scope="global")
 
+    # ----------------------------------------------------------
+    # 门面接口：统一记忆存取
+    # ----------------------------------------------------------
 
-# 兼容旧接口（原 ResearchMemory 由 MemoryManager 取代）
-ResearchMemory = MemoryManager
+    def set_project_path(self, project_path: str):
+        """切换当前项目（决定长期记忆的 project 作用域）"""
+        if project_path:
+            self.project = os.path.abspath(project_path)
+
+    def add_tool_result(
+        self,
+        content: str,
+        result: str | None = None,
+        max_chars: int = 500,
+    ):
+        """工具结果进短期记忆（截断过长结果）
+
+        兼容两种调用：add_tool_result("内容") 旧接口；add_tool_result("工具名", "结果") 新接口。
+        """
+        if result is None:
+            item_content = content
+            metadata = {"source": "tool"}
+        else:
+            truncated = (
+                result if len(result) <= max_chars else result[:max_chars] + "...(已截断)"
+            )
+            item_content = f"[{content}] {truncated}"
+            metadata = {"source": "tool", "toolName": content}
+        item = MemoryItem(
+            type="tool_result",
+            role="tool",
+            content=item_content,
+            metadata=metadata,
+        )
+        self.short_term.store(item)
+        self._compress_if_needed()
+
+    def store_fact(self, fact: str, scope: str = "project", source: str = "manual"):
+        """存储关键事实到长期记忆"""
+        self.add_fact(fact, scope=scope, source=source)
+
+    def list_long_term(self) -> list[MemoryItem]:
+        return self.long_term.get_all(None)
+
+    def search_long_term(self, query: str, limit: int) -> list[MemoryItem]:
+        return self.long_term.search(query, limit, project=self.project)
+
+    def delete_long_term(self, entry_id: str) -> bool:
+        """按 id 删除一条长期事实"""
+        return self.long_term.delete(entry_id)
+
+    def record_token_usage(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        cached_input_tokens: int = 0,
+    ):
+        self.token_budget_control.record_usage(
+            input_tokens, output_tokens, cached_input_tokens
+        )
+
+    def compress_if_needed(self) -> bool:
+        """检查并触发压缩（基于 TokenBudget 阈值）"""
+        if not self.token_budget_control.needs_compression(
+            self.short_term, self.context_profile.compression_trigger_ratio
+        ):
+            return False
+        return self._compress_if_needed()
+
+    def clear_short_term(self):
+        self.short_term.clear()
+
+    def clear_long_term(self):
+        self.long_term.clear()
+
+    def get_system_status(self) -> str:
+        """记忆系统整体状态"""
+        return (
+            f"上下文策略: {self.context_profile.summary()}\n"
+            + self.short_term.get_status_summary()
+            + "\n"
+            + self.long_term.get_status_summary()
+            + "\n"
+            + self.token_budget_control.usage_report()
+        )

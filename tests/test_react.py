@@ -113,7 +113,7 @@ class AgentReactLoopTest(unittest.TestCase):
             "arguments": json.dumps(args or {"args": "q1"}),
         }
 
-    @patch("minimate.orchestrator.llm.chat_tools")
+    @patch("minimate.agent.agent.llm.chat_tools")
     def test_loop_ends_on_final_answer(self, mock_chat_tools):
         """先调一次工具，再输出最终内容 → 返回答案"""
         mock_chat_tools.side_effect = [
@@ -132,7 +132,7 @@ class AgentReactLoopTest(unittest.TestCase):
         self.assertEqual(last["role"], "tool")
         self.assertIn("结果[q1]", last["content"])
 
-    @patch("minimate.orchestrator.llm.chat_tools")
+    @patch("minimate.agent.agent.llm.chat_tools")
     def test_multiple_tool_calls_single_assistant_message(self, mock_chat_tools):
         """一次返回多个 tool_calls：只回填一条 assistant（含全部调用）+ 每条结果一个 tool 消息"""
         mock_chat_tools.side_effect = [
@@ -157,7 +157,7 @@ class AgentReactLoopTest(unittest.TestCase):
         self.assertEqual(len(tool_msgs), 2)
         self.assertEqual({m["tool_call_id"] for m in tool_msgs}, {"call_1", "call_2"})
 
-    @patch("minimate.orchestrator.llm.chat_tools")
+    @patch("minimate.agent.agent.llm.chat_tools")
     def test_stops_at_max_steps(self, mock_chat_tools):
         """模型一直调工具不结束 → 达到 max_steps 后追加一次强制收尾调用"""
         mock_chat_tools.return_value = {"content": "", "tool_calls": [self._fc_call()]}
@@ -167,7 +167,7 @@ class AgentReactLoopTest(unittest.TestCase):
         self.assertEqual(mock_chat_tools.call_count, 4)  # 3 轮工具 + 1 次强制收尾
         self.assertEqual(result, "")
 
-    @patch("minimate.orchestrator.llm.chat_tools")
+    @patch("minimate.agent.agent.llm.chat_tools")
     def test_forced_final_answer_at_max_steps(self, mock_chat_tools):
         """步数耗尽后强制收尾：最后一次调用给出答案则返回，而不是 (无输出)"""
         mock_chat_tools.side_effect = [
@@ -181,7 +181,7 @@ class AgentReactLoopTest(unittest.TestCase):
         self.assertEqual(result, "最终答案")
         self.assertEqual(mock_chat_tools.call_count, 3)
 
-    @patch("minimate.orchestrator.llm.chat_tools")
+    @patch("minimate.agent.agent.llm.chat_tools")
     def test_direct_content_is_final(self, mock_chat_tools):
         """FC 模式无工具调用时，content 即最终答案"""
         mock_chat_tools.return_value = {"content": "这是一段直接回答", "tool_calls": []}
@@ -189,7 +189,24 @@ class AgentReactLoopTest(unittest.TestCase):
         result = agent.run("测试任务")
         self.assertEqual(result, "这是一段直接回答")
 
-    @patch("minimate.orchestrator.llm.chat_tools")
+    @patch("minimate.agent.agent.llm.chat_tools")
+    def test_tool_calls_recorded_in_tool_memory(self, mock_chat_tools):
+        """每次真实工具执行都写入工具调用记忆"""
+        mock_chat_tools.side_effect = [
+            {"content": "", "tool_calls": [self._fc_call()]},
+            {"content": "最终答案", "tool_calls": []},
+        ]
+        agent = _make_agent()
+        result = agent.run("测试任务")
+
+        self.assertEqual(result, "最终答案")
+        self.assertEqual(len(agent.tool_memory), 1)
+        record = agent.tool_memory.records[0]
+        self.assertEqual(record.tool_name, "fake_tool")
+        self.assertTrue(record.ok)
+        self.assertTrue(record.loop_id.startswith("loop-"))
+
+    @patch("minimate.agent.agent.llm.chat_tools")
     def test_repeat_call_detected(self, mock_chat_tools):
         """相同工具相同参数连续调用 → 第二次起不执行，回灌重复提示"""
         calls = [self._fc_call()]
@@ -209,8 +226,8 @@ class AgentReactLoopTest(unittest.TestCase):
         self.assertIn("[重复调用]", last["content"])
         self.assertNotIn("结果[q1]", last["content"])
 
-    @patch("minimate.orchestrator.llm.chat")
-    @patch("minimate.orchestrator.llm.chat_tools")
+    @patch("minimate.agent.agent.llm.chat")
+    @patch("minimate.agent.agent.llm.chat_tools")
     def test_fc_fallback_to_text(self, mock_chat_tools, mock_chat):
         """FC 通道异常时降级到文本协议"""
         mock_chat_tools.side_effect = RuntimeError("tools 不支持")
@@ -220,7 +237,7 @@ class AgentReactLoopTest(unittest.TestCase):
         self.assertEqual(result, "文本协议答案")
         mock_chat.assert_called_once()
 
-    @patch("minimate.orchestrator.llm.call")
+    @patch("minimate.agent.agent.llm.call")
     def test_no_tools_uses_single_call(self, mock_call):
         """无工具 Agent 不进入 ReAct 循环，单次调用"""
         mock_call.return_value = "规划结果"
@@ -259,7 +276,7 @@ class ParsePlanTest(unittest.TestCase):
 class AgentModeTest(unittest.TestCase):
     """三种执行模式"""
 
-    @patch("minimate.orchestrator.llm.call")
+    @patch("minimate.agent.agent.llm.call")
     def test_chat_mode_single_call(self, mock_call):
         """chat 模式：无论有无工具，都只调用一次 LLM"""
         mock_call.return_value = "直接答案"
@@ -268,8 +285,8 @@ class AgentModeTest(unittest.TestCase):
         self.assertEqual(result, "直接答案")
         mock_call.assert_called_once()
 
-    @patch("minimate.orchestrator.llm.call")
-    @patch("minimate.orchestrator.llm.chat")
+    @patch("minimate.agent.agent.llm.call")
+    @patch("minimate.agent.agent.llm.chat")
     def test_plan_mode_executes_steps(self, mock_chat, mock_call):
         """plan 模式：生成计划 → 逐步执行 → 汇总（无工具 Agent 每步走单次调用）"""
         plan_json = '[{"step": "a", "goal": "步骤一", "detail": "做A"}, {"step": "b", "goal": "步骤二", "detail": "做B"}]'
@@ -281,8 +298,8 @@ class AgentModeTest(unittest.TestCase):
         self.assertEqual(mock_call.call_count, 4)  # 计划 + 2 步骤 + 汇总
         mock_chat.assert_not_called()
 
-    @patch("minimate.orchestrator.llm.chat_tools")
-    @patch("minimate.orchestrator.llm.call")
+    @patch("minimate.agent.agent.llm.chat_tools")
+    @patch("minimate.agent.agent.llm.call")
     def test_plan_action_direct(self, mock_call, mock_chat_tools):
         """action 步骤直连工具，LLM 不参与（只计划 + 汇总两次调用）"""
         plan_json = json.dumps([{
@@ -300,9 +317,9 @@ class AgentModeTest(unittest.TestCase):
         mock_chat_tools.assert_not_called()  # action 直连，不进 ReAct
         self.assertEqual(mock_call.call_count, 2)  # 计划 + 汇总
 
-    @patch("minimate.orchestrator.llm.chat_tools", return_value={"content": "降级处理", "tool_calls": []})
-    @patch("minimate.orchestrator.llm.call")
-    @patch("minimate.orchestrator.time.sleep")
+    @patch("minimate.agent.agent.llm.chat_tools", return_value={"content": "降级处理", "tool_calls": []})
+    @patch("minimate.agent.agent.llm.call")
+    @patch("minimate.agent.agent.time.sleep")
     def test_action_retry_on_retryable(self, mock_sleep, mock_call, mock_chat_tools):
         """action 直连遇 [可重试] 错误：自动重试一次，而非立即降级 LLM"""
         calls = {"n": 0}

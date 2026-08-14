@@ -1,58 +1,10 @@
-"""
-LLM 调用封装 —— 统一管理 API 调用
-"""
+"""LLM 对话调用 —— react / plan / memory 压缩统一走这里"""
 
-import os
-from openai import OpenAI
+from .client import get_client, get_model
+from .stats import _record_usage
 
-_client: OpenAI | None = None
-
-# Token 用量统计（进程级累计）
-_stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
-
-
-def get_stats() -> dict:
-    """返回累计 Token 统计（调用次数 / prompt / completion）"""
-    return dict(_stats)
-
-
-def reset_stats() -> None:
-    """重置 Token 统计"""
-    _stats["calls"] = 0
-    _stats["prompt_tokens"] = 0
-    _stats["completion_tokens"] = 0
-
-
-def _record_usage(resp) -> None:
-    """记录一次响应的 token 用量"""
-    global _stats
-    _stats["calls"] += 1
-    usage = getattr(resp, "usage", None)
-    if usage is not None:
-        _stats["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
-        _stats["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
-
-
-def get_client() -> OpenAI:
-    global _client
-    if _client is None:
-        api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
-        base_url = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
-        model = os.getenv("OPENAI_MODEL_NAME", "deepseek-chat")
-
-        if not api_key:
-            raise RuntimeError(
-                "请设置 DEEPSEEK_API_KEY 或 OPENAI_API_KEY 环境变量"
-            )
-
-        _client = OpenAI(api_key=api_key, base_url=base_url)
-        _client._model = model  # type: ignore
-
-    return _client
-
-
-def get_model() -> str:
-    return os.getenv("OPENAI_MODEL_NAME", "deepseek-chat")
+DEFAULT_MAX_TOKENS = 4096
+DEFAULT_TEMPERATURE = 0.3
 
 
 def call(prompt: str, system: str = "", temperature: float = 0.3) -> str:
@@ -73,7 +25,7 @@ def chat(messages: list[dict], temperature: float = 0.3) -> str:
             model=get_model(),
             messages=messages,
             temperature=temperature,
-            max_tokens=4096,
+            max_tokens=DEFAULT_MAX_TOKENS,
         )
         _record_usage(resp)
         return resp.choices[0].message.content.strip()
@@ -102,7 +54,7 @@ def chat_tools(
             model=get_model(),
             messages=messages,
             temperature=temperature,
-            max_tokens=4096,
+            max_tokens=DEFAULT_MAX_TOKENS,
             **kwargs,
         )
         _record_usage(resp)

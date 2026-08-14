@@ -32,7 +32,7 @@ load_dotenv()
 from minimate import __version__
 from minimate.tools import ToolExecutor, register_all_tools
 from minimate.memory import MemoryManager
-from minimate.orchestrator import Agent
+from minimate.agent import Agent
 from minimate.rag import get_knowledge_base
 from minimate.colors import color
 from minimate.config import get_mcp_servers
@@ -123,7 +123,7 @@ def _memory_report(memory) -> str:
     facts = memory.long_term.items
     if facts:
         lines.append("\n  【长期记忆】")
-        lines.extend(f"    - {f.content[:100]}" for f in facts[-5:])
+    lines.extend(f"    - [{f.id}] {f.content[:100]}" for f in facts[-5:])
     summaries = memory.short_term.get_summaries()
     if summaries:
         lines.append("\n  【历史摘要】")
@@ -256,6 +256,7 @@ def build_agent(
         tools=tools,
         memory=memory,
         max_steps=max_steps,
+        tool_memory=memory.tool_memory,
     )
 
 
@@ -420,7 +421,14 @@ def interactive(kb_path: str = "", max_steps: int = 8):
         elif cmd == "/code_repo":
             print(color.cyan(_code_repo_command(arg)))
         elif cmd == "/memory":
-            print(color.yellow(_memory_report(memory)))
+            if arg.startswith("del "):
+                entry_id = arg.split(maxsplit=1)[1].strip()
+                if memory.delete_long_term(entry_id):
+                    print(color.green(f"  已删除长期事实 #{entry_id}"))
+                else:
+                    print(color.red(f"  未找到 id={entry_id} 的长期事实"))
+            else:
+                print(color.yellow(_memory_report(memory)))
         elif cmd == "/clear":
             memory.clear()
             print(color.green("  会话记忆已清空"))

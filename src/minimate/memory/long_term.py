@@ -1,18 +1,17 @@
 """长期记忆 —— SQLite 持久化（memories 表）+ 归一化去重 + 关键词检索
 
-表结构对齐 PaiCLI memory.db 设计：scope / content / created_at / kind /
+表结构：scope / content / created_at / kind /
 source / importance / confidence / updated_at / expires_at / access_count /
 content_hash。跨会话保留用户偏好、项目信息等事实，Agent 启动时自动加载。
 """
 
 import hashlib
-import json
 import os
 import re
 import sqlite3
 from datetime import datetime, timezone
 
-from .core import MemoryItem, score_relevance
+from .core import Memory, MemoryItem, score_relevance
 
 
 def _default_db_path() -> str:
@@ -31,7 +30,7 @@ def _iso_to_epoch(iso: str) -> float:
         return 0.0
 
 
-class LongTermMemory:
+class LongTermMemory(Memory):
     def __init__(self, path: str = "", max_items: int = 500):
         self.path = path or _default_db_path()
         self.max_items = max_items
@@ -41,7 +40,6 @@ class LongTermMemory:
         self._init_schema()
         self._items: list[MemoryItem] = []
         self._normalize_existing()
-        self._migrate_legacy_json()
         self.load()
 
     # ----------------------------------------------------------
@@ -80,44 +78,6 @@ class LongTermMemory:
         finally:
             conn.close()
 
-    def _legacy_json_path(self) -> str:
-        """旧版 JSON 持久化路径（项目 .cache/memory.json）"""
-        return os.path.join(
-            os.path.dirname(__file__), "..", "..", "..", ".cache", "memory.json"
-        )
-
-    def _migrate_legacy_json(self):
-        """首次使用默认库时，把旧 JSON 长期记忆导入 SQLite（旧文件保留作备份）"""
-        if os.path.normpath(self.path) != os.path.normpath(_default_db_path()):
-            return
-        legacy = self._legacy_json_path()
-        if not os.path.exists(legacy):
-            return
-        conn = self._connect()
-        try:
-            count = conn.execute("SELECT COUNT(*) AS c FROM memories").fetchone()["c"]
-        finally:
-            conn.close()
-        if count:
-            return
-        try:
-            with open(legacy, encoding="utf-8") as f:
-                data = json.load(f)
-            for d in data:
-                content = (d.get("content") or "").strip()
-                if not content:
-                    continue
-                meta = d.get("metadata") or {}
-                self.add_fact(
-                    content,
-                    keywords=d.get("keywords") or None,
-                    scope="global" if meta.get("scope") == "global" else "project",
-                    project=meta.get("project", ""),
-                    source="migrated",
-                )
-        except (OSError, ValueError):
-            pass
-
     # ----------------------------------------------------------
     # 写入（含去重）
     # ----------------------------------------------------------
@@ -129,11 +89,12 @@ class LongTermMemory:
         scope: str = "project",
         project: str = "",
         source: str = "manual",
+        kind: str = "fact",
     ) -> bool:
         """添加事实；按归一化内容哈希去重，重复则跳过。
 
         scope：global（跨项目可见）或 project（仅当前项目可见，默认）
-        source：manual / agent / migrated 等，记录事实来源
+        source：manual / agent 等，记录事实来源
         """
         content = (content or "").strip()
         if not content:
@@ -155,17 +116,18 @@ class LongTermMemory:
                     # 超容量时淘汰最旧记录（最小 id）
                     conn.execute("DELETE FROM memories WHERE id = ?", (row["mid"],))
             try:
-                conn.execute(
+                cur = conn.execute(
                     """
                     INSERT INTO memories
                         (scope, content, created_at, kind, source, importance,
                          confidence, updated_at, expires_at, access_count, content_hash)
-                    VALUES (?, ?, ?, 'fact', ?, 0.5, 1.0, ?, NULL, 0, ?)
+                    VALUES (?, ?, ?, ?, ?, 0.5, 1.0, ?, NULL, 0, ?)
                     """,
-                    (db_scope, content, created_iso, source, created_iso, digest),
+                    (db_scope, content, created_iso, kind, source, created_iso, digest),
                 )
             except sqlite3.IntegrityError:
                 return False  # 并发插入重复时的兜底
+            new_id = cur.lastrowid
             conn.commit()
         finally:
             conn.close()
@@ -184,6 +146,7 @@ class LongTermMemory:
             timestamp=now.timestamp(),
         )
         item._digest = digest
+        item.id = str(new_id)
         self._items.append(item)
         if len(self._items) > self.max_items:
             self._items.pop(0)
@@ -314,6 +277,7 @@ class LongTermMemory:
             metadata=metadata,
         )
         item._digest = row["content_hash"]
+        item.id = str(row["id"])
         return item
 
     @property
@@ -328,3 +292,71 @@ class LongTermMemory:
         finally:
             conn.close()
         self._items.clear()
+
+    # ----------------------------------------------------------
+    # Memory 接口补充
+    # ----------------------------------------------------------
+
+    def store(self, entry: MemoryItem) -> None:
+        """按 Memory 接口存储一条条目（类型/来源取自 entry 自身）"""
+        self.add_fact(
+            entry.content,
+            keywords=entry.keywords or None,
+            scope=entry.metadata.get("scope", "project"),
+            project=entry.metadata.get("project", ""),
+            source=entry.metadata.get("source", "manual"),
+            kind=entry.type,
+        )
+
+    def retrieve(self, entry_id: str) -> MemoryItem | None:
+        return next((i for i in self._items if i.id == str(entry_id)), None)
+
+    def delete(self, entry_id: str) -> bool:
+        conn = self._connect()
+        try:
+            cur = conn.execute("DELETE FROM memories WHERE id = ?", (entry_id,))
+            conn.commit()
+            deleted = cur.rowcount > 0
+        finally:
+            conn.close()
+        if deleted:
+            self._items = [i for i in self._items if i.id != str(entry_id)]
+        return deleted
+
+    def get_all(self, project_key: str | None = None) -> list[MemoryItem]:
+        if project_key is None:
+            return list(self._items)
+        return [i for i in self._items if self.is_visible_in_project(i, project_key)]
+
+    def get_by_type(self, memory_type: str) -> list[MemoryItem]:
+        return [i for i in self._items if i.type == memory_type]
+
+    def get_token_count(self) -> int:
+        return sum(i.tokens for i in self._items)
+
+    def size(self) -> int:
+        return len(self._items)
+
+    @staticmethod
+    def scope_of(entry: MemoryItem) -> str:
+        """条目的作用域：global 或 project"""
+        scope = str(entry.metadata.get("scope", "project")).lower()
+        return "project" if scope == "project" else "global"
+
+    @staticmethod
+    def is_visible_in_project(entry: MemoryItem, project_key: str | None) -> bool:
+        """项目可见性：global 全可见；project 需 projectKey 匹配"""
+        if LongTermMemory.scope_of(entry) == "global":
+            return True
+        entry_project = entry.metadata.get("project", "")
+        return bool(project_key) and entry_project == project_key
+
+    def get_status_summary(self) -> str:
+        from collections import Counter
+
+        counts = Counter(i.type for i in self._items)
+        return (
+            f"长期记忆: {len(self._items)}条 / {self.get_token_count()} tokens "
+            f"(事实: {counts.get('fact', 0)}, 摘要: {counts.get('summary', 0)}, "
+            f"工具结果: {counts.get('tool_result', 0)})"
+        )

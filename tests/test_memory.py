@@ -11,6 +11,7 @@ from minimate.memory import (
     MemoryItem,
     MemoryManager,
     ShortTermMemory,
+    ToolMemory,
     estimate_tokens,
 )
 
@@ -28,17 +29,27 @@ class ShortTermMemoryTest(unittest.TestCase):
         """超 token 硬预算自动淘汰最旧条目（滑动窗口）"""
         mem = ShortTermMemory(token_budget=30)
         for i in range(10):
-            mem.add(MemoryItem(type="conversation", role="user", content=f"消息内容{i} 一些字数"))
+            mem.store(MemoryItem(type="conversation", role="user", content=f"消息内容{i} 一些字数"))
         self.assertLessEqual(mem.get_token_count(), 30)
         self.assertGreater(len(mem.items), 1)
+        self.assertGreater(mem._evicted_count, 0)  # 只计数，不保留被淘汰内容
+        self.assertIn("已淘汰", mem.get_status_summary())
 
     def test_get_context_recent_first(self):
         mem = ShortTermMemory(token_budget=1000)
-        mem.add(MemoryItem(type="conversation", role="user", content="第一轮"))
-        mem.add(MemoryItem(type="conversation", role="assistant", content="回答"))
+        mem.store(MemoryItem(type="conversation", role="user", content="第一轮"))
+        mem.store(MemoryItem(type="conversation", role="assistant", content="回答"))
         ctx = mem.get_context()
         self.assertIn("第一轮", ctx)
         self.assertIn("回答", ctx)
+
+    def test_store_retrieve_delete(self):
+        mem = ShortTermMemory(token_budget=10000)
+        item = MemoryItem(type="conversation", role="user", content="hi")
+        mem.store(item)
+        self.assertIsNotNone(mem.retrieve(item.id))
+        self.assertTrue(mem.delete(item.id))
+        self.assertEqual(mem.size(), 0)
 
 
 class LongTermMemoryTest(unittest.TestCase):
@@ -110,7 +121,7 @@ class LongTermMemoryTest(unittest.TestCase):
         self.assertIn("AI Agent", mem2.items[0].content)
 
     def test_sqlite_schema_and_access_count(self):
-        """SQLite 表结构对齐 PaiCLI memories 设计；检索命中递增 access_count"""
+        """SQLite 表结构设计；检索命中递增 access_count"""
         import sqlite3
 
         mem = LongTermMemory(path=self.path)
@@ -299,6 +310,45 @@ class ProjectScopeTest(unittest.TestCase):
         self.assertGreater(score_relevance(item, "我家猫咪叫什么"), 0)
 
 
+class ToolMemoryTest(unittest.TestCase):
+    """工具调用记忆：循环内重复检测 + 跨循环隔离 + 参数归一化"""
+
+    def test_repeat_detection_within_loop(self):
+        mem = ToolMemory()
+        loop = mem.new_loop()
+        mem.record("read_file", {"path": "a.txt"}, "内容", ok=True, loop_id=loop)
+        self.assertEqual(mem.repeated_count("read_file", {"path": "a.txt"}, loop), 1)
+        # 不同参数不算重复
+        self.assertEqual(mem.repeated_count("read_file", {"path": "b.txt"}, loop), 0)
+        # 其他循环不受影响（跨循环不误判）
+        other = mem.new_loop()
+        self.assertEqual(mem.repeated_count("read_file", {"path": "a.txt"}, other), 0)
+
+    def test_consecutive_semantics(self):
+        """中间隔了其他调用 → 不算连续重复"""
+        mem = ToolMemory()
+        loop = mem.new_loop()
+        mem.record("a", {"x": 1}, "r1", loop_id=loop)
+        mem.record("b", {"y": 2}, "r2", loop_id=loop)
+        self.assertEqual(mem.repeated_count("a", {"x": 1}, loop), 0)
+
+    def test_args_normalization(self):
+        """dict 参数顺序无关"""
+        mem = ToolMemory()
+        loop = mem.new_loop()
+        mem.record("t", {"b": 1, "a": 2}, "r", loop_id=loop)
+        self.assertEqual(mem.repeated_count("t", {"a": 2, "b": 1}, loop), 1)
+
+    def test_history_and_failed(self):
+        mem = ToolMemory()
+        loop = mem.new_loop()
+        mem.record("ok", {}, "好", ok=True, loop_id=loop)
+        mem.record("bad", {}, "[可重试] 网络错误", ok=False, loop_id=loop)
+        self.assertEqual(len(mem), 2)
+        self.assertEqual(len(mem.failed()), 1)
+        self.assertEqual(mem.history(1)[0].tool_name, "bad")
+
+
 class CompressionTriggerTest(unittest.TestCase):
     """P1：trigger_ratio 触发压缩 + 降级"""
 
@@ -309,12 +359,13 @@ class CompressionTriggerTest(unittest.TestCase):
 
         mem = ShortTermMemory(token_budget=300, trigger_ratio=0.5)
         for i in range(10):
-            mem.add(MemoryItem(type="conversation", role="user", content=f"第{i}轮长内容信息" * 3))
+            mem.store(MemoryItem(type="conversation", role="user", content=f"第{i}轮长内容信息" * 3))
         self.assertTrue(mem.needs_compression())
         self.assertTrue(mem.compress_old(FakeCompressor(), keep_recent_rounds=1))
-        # 注入摘要 + 保留最近 1 轮（2 条）
-        self.assertLessEqual(len(mem.items), 3)
-        self.assertTrue(any(i.type == "summary" for i in mem.items))
+        # 旧条目移出 _entries，摘要单独存 _summaries，保留最近 1 轮（2 条）
+        self.assertEqual(len(mem.items), 2)
+        self.assertIn("历史摘要内容", mem.get_summaries())
+        self.assertFalse(any(i.type == "summary" for i in mem.items))
 
     def test_compressor_fallback_on_llm_failure(self):
         from minimate.memory.compressor import MapReduceCompressor
