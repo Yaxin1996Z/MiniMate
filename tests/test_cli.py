@@ -1,11 +1,14 @@
 """CLI 交互模式单元测试 —— mock 输入，验证命令与退出流程"""
 
 import io
+import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from cli import _display_width, _input_windows, interactive
+from cli import _display_width, _input_windows, _repos_command, interactive
+from minimate.memory import MemoryManager
 
 
 class InteractiveTest(unittest.TestCase):
@@ -105,6 +108,44 @@ class InputHistoryTest(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("> /memory" + " " * 7 + "\r> /memory", text)
         self.assertIn("> " + " " * 14 + "\r> ", text)
+
+
+class ReposCommandTest(unittest.TestCase):
+    """/repos 命令：配置/索引后写入长期记忆，引导 LLM 用 search_code"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "memory.db")
+        self.mem = MemoryManager(memory_path=self.path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @patch("minimate.coderag.CodeRAGManager")
+    def test_add_writes_memory_fact(self, mock_cls):
+        mgr = mock_cls.return_value
+        mgr.list_repos.return_value = {}
+        result = _repos_command("add demo D:/tmp/proj", memory=self.mem)
+        self.assertIn("已配置仓库", result)
+        facts = self.mem.list_long_term()
+        self.assertTrue(
+            any(
+                "代码仓库 demo" in f.content and "search_code" in f.content
+                for f in facts
+            )
+        )
+
+    @patch("minimate.coderag.CodeRAGManager")
+    def test_index_replaces_memory_fact(self, mock_cls):
+        mgr = mock_cls.return_value
+        mgr.index.return_value = {"chunks": 10, "relations": 3, "db": "x"}
+        _repos_command("index demo", memory=self.mem)
+        _repos_command("index demo", memory=self.mem)
+        facts = [
+            f for f in self.mem.list_long_term() if "代码仓库 demo" in f.content
+        ]
+        self.assertEqual(len(facts), 1)
+        self.assertIn("10 个代码块", facts[0].content)
 
 
 if __name__ == "__main__":

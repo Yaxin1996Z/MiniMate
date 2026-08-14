@@ -1,16 +1,17 @@
-"""轻量级代码向量化 —— hashing TF 向量 + 余弦相似度（零模型依赖）
+"""代码向量化 —— 可插拔 EmbeddingProvider
 
-面向代码检索场景：不引入 embedding 模型，用稳定哈希（md5）将
-token（标识符 / camelCase 拆分 / 中文滑窗）映射到固定维度词频向量，
-L2 归一化后以 JSON 数组持久化，检索时在内存计算余弦相似度。
+默认使用真实语义模型 bge-m3（sentence-transformers，懒加载），
+模型不可用时自动回退到零依赖的哈希词频向量（md5 → 2048 维）。
 """
 
 import hashlib
 import math
+import os
 import re
 
 
 DIM = 2048
+DEFAULT_MODEL_PATH = "D:/Documents/Models/Embedding/bge-m3"
 
 
 def _stable_hash(token: str) -> int:
@@ -57,3 +58,57 @@ def cosine(a: list[float], b: list[float]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
     return sum(x * y for x, y in zip(a, b))
+
+
+class EmbeddingProvider:
+    """真实语义 embedding（默认 bge-m3，懒加载；模型不可用时回退哈希向量）"""
+
+    def __init__(self, model_path: str | None = None):
+        self.model_path = model_path or os.getenv(
+            "MINIMATE_EMBED_MODEL", DEFAULT_MODEL_PATH
+        )
+        self._model = None
+
+    def _load(self):
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+
+            self._model = SentenceTransformer(self.model_path)
+        return self._model
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        """批量编码（L2 归一化，余弦=点积）；模型加载失败回退哈希向量"""
+        try:
+            vecs = self._load().encode(
+                [t or "" for t in texts],
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                batch_size=32,
+            )
+            return [v.tolist() for v in vecs]
+        except Exception:
+            return [embed(t) for t in texts]
+
+    def encode_one(self, text: str) -> list[float]:
+        return self.encode([text])[0]
+
+
+class HashEmbeddingProvider:
+    """轻量哈希向量 Provider（测试 / 无模型兜底）"""
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        return [embed(t) for t in texts]
+
+    def encode_one(self, text: str) -> list[float]:
+        return embed(text)
+
+
+_provider: EmbeddingProvider | None = None
+
+
+def get_provider() -> EmbeddingProvider:
+    """全局共享的 embedding Provider（进程内只加载一次模型）"""
+    global _provider
+    if _provider is None:
+        _provider = EmbeddingProvider()
+    return _provider

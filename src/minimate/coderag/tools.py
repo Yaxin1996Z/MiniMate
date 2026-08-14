@@ -18,7 +18,7 @@ def search_code(query: str, repo: str = "", top_k: int = 3) -> str:
     mgr = CodeRAGManager()
     repos = mgr.list_repos()
     if not repos:
-        return "未配置代码仓库。请先使用 /code_repo add <名称> <路径或URL> 配置并 index。"
+        return "未配置代码仓库。请先使用 /repos add <名称> <路径或URL> 配置并 index。"
     name = repo if repo in repos else next(iter(repos))
     try:
         results = mgr.search(name, query, max(1, min(top_k, 10)))

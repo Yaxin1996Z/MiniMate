@@ -3,6 +3,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from minimate.coderag import (
     CodeRAGManager,
@@ -11,7 +12,8 @@ from minimate.coderag import (
     index_directory,
     index_file,
 )
-from minimate.coderag.embeddings import tokenize
+from minimate.coderag.embeddings import HashEmbeddingProvider, tokenize
+from minimate.coderag.bm25 import BM25
 from minimate.coderag.storage import SQLiteCodeStorage
 from minimate.coderag.retriever import CodeRetriever
 
@@ -119,7 +121,11 @@ class ManagerTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_add_index_search(self):
-        mgr = CodeRAGManager(rag_dir=self.rag, repos_dir=os.path.join(self.tmp.name, "repos"))
+        mgr = CodeRAGManager(
+            rag_dir=self.rag,
+            repos_dir=os.path.join(self.tmp.name, "repos"),
+            provider=HashEmbeddingProvider(),
+        )
         mgr.add_repo("demo", os.path.join(self.tmp.name, "proj"))
         info = mgr.index("demo")
         self.assertGreater(info["chunks"], 0)
@@ -130,9 +136,95 @@ class ManagerTest(unittest.TestCase):
         self.assertTrue(results)
 
         # 持久化后重新加载（跨进程向量稳定性）
-        mgr2 = CodeRAGManager(rag_dir=self.rag, repos_dir=os.path.join(self.tmp.name, "repos"))
+        mgr2 = CodeRAGManager(
+            rag_dir=self.rag,
+            repos_dir=os.path.join(self.tmp.name, "repos"),
+            provider=HashEmbeddingProvider(),
+        )
         results2 = mgr2.search("demo", "Service 处理数据")
         self.assertTrue(results2)
+
+        # 混合检索字段
+        self.assertIn("bm25", results[0])
+        self.assertIn("cosine", results[0])
+
+    def test_bm25_scores_identifier_docs(self):
+        """BM25 对包含查询标识符的文档给更高分"""
+        docs = [
+            "class BaseService: def run(self): pass",
+            "class Service(BaseService): def process(self, data): return self.run()",
+            "def main(): print('hello')",
+        ]
+        bm = BM25(docs)
+        scores = bm.score("Service process")
+        self.assertGreater(scores[1], scores[0])
+        self.assertGreater(scores[1], scores[2])
+
+    def test_update_reindex_local(self):
+        """update：本地目录重新扫描并重建索引，新增代码可被检索"""
+        mgr = CodeRAGManager(
+            rag_dir=self.rag,
+            repos_dir=os.path.join(self.tmp.name, "repos"),
+            provider=HashEmbeddingProvider(),
+        )
+        mgr.add_repo("demo", os.path.join(self.tmp.name, "proj"))
+        info1 = mgr.index("demo")
+
+        with open(
+            os.path.join(self.tmp.name, "proj", "pkg", "extra.py"),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            f.write("def helper():\n    return 'extra'\n")
+
+        info2 = mgr.update("demo")
+        self.assertGreaterEqual(info2["chunks"], info1["chunks"])
+        self.assertTrue(mgr.search("demo", "helper"))
+
+    @patch("minimate.coderag.manager.subprocess.run", side_effect=FileNotFoundError)
+    def test_search_keyword_fallback_scan(self, mock_run):
+        """rg 不可用时回退逐行扫描，仍能精确关键词定位"""
+        mgr = CodeRAGManager(
+            rag_dir=self.rag,
+            repos_dir=os.path.join(self.tmp.name, "repos"),
+            provider=HashEmbeddingProvider(),
+        )
+        mgr.add_repo("demo", os.path.join(self.tmp.name, "proj"))
+        hits = mgr.search_keyword("demo", "process")
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["granularity"], "keyword")
+
+    @patch("minimate.coderag.manager.subprocess.run", side_effect=FileNotFoundError)
+    def test_search_two_stage_identifier_first(self, mock_run):
+        """标识符查询：rg 关键词命中排在最前，再补语义召回"""
+        mgr = CodeRAGManager(
+            rag_dir=self.rag,
+            repos_dir=os.path.join(self.tmp.name, "repos"),
+            provider=HashEmbeddingProvider(),
+        )
+        mgr.add_repo("demo", os.path.join(self.tmp.name, "proj"))
+        mgr.index("demo")
+        results = mgr.search("demo", "process")
+        self.assertTrue(results)
+        self.assertEqual(results[0]["granularity"], "keyword")
+
+    @patch("minimate.coderag.manager.subprocess.run")
+    def test_update_pull_failure_still_reindexes(self, mock_run):
+        """git pull 失败（网络不可达）不中断，降级为使用现有代码重建索引"""
+        repo_dir = os.path.join(self.tmp.name, "repos", "demo")
+        _sample_project(repo_dir)  # 模拟已 clone 的本地目录
+        fake_result = type(
+            "R", (), {"returncode": 1, "stderr": "Failed to connect", "stdout": ""}
+        )()
+        mock_run.return_value = fake_result
+        mgr = CodeRAGManager(
+            rag_dir=self.rag,
+            repos_dir=os.path.join(self.tmp.name, "repos"),
+            provider=HashEmbeddingProvider(),
+        )
+        mgr.add_repo("demo", "https://github.com/example/demo.git")
+        info = mgr.update("demo")
+        self.assertGreater(info["chunks"], 0)
 
 
 if __name__ == "__main__":

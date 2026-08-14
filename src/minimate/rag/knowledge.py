@@ -62,14 +62,10 @@ class KnowledgeBase:
         db_dir = os.path.join(os.path.dirname(__file__), cfg["db_dir"])
         embed_path = cfg["embed_model_path"]
 
-        # Docker 环境：Windows 路径不存在时，自动转换到容器挂载路径
+        # 环境变量可覆盖模型路径（便于切换模型 / 容器挂载）
+        embed_path = os.getenv("MINIMATE_EMBED_MODEL", embed_path)
         if not os.path.exists(embed_path):
-            alt_path = embed_path.replace("C:\\Users\\ZhangYaxin\\.cache", "/root/.cache")
-            alt_path = alt_path.replace("\\", "/")  # 统一正斜杠
-            if os.path.exists(alt_path):
-                embed_path = alt_path
-            else:
-                print(f"  ⚠️ 模型路径不存在：{alt_path}")
+            print(f"  ⚠️ 模型路径不存在：{embed_path}")
 
         os.makedirs(self._repo_dir, exist_ok=True)
         os.makedirs(db_dir, exist_ok=True)

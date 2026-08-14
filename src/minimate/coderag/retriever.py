@@ -1,35 +1,54 @@
-"""代码检索 —— 余弦相似度 + 调用链查询"""
+"""代码检索 —— BM25 + 余弦向量 RRF 混合检索 + 调用链查询"""
 
 from collections import deque
 
+from .bm25 import BM25
 from .embeddings import cosine, embed
 
 
 class CodeRetriever:
-    def __init__(self, storage):
+    def __init__(self, storage, provider=None):
         self.storage = storage
+        self._embed_one = provider.encode_one if provider else embed
 
     # ----------------------------------------------------------
     # 语义检索（余弦相似度，内存计算）
     # ----------------------------------------------------------
 
     def search(self, repo: str, query: str, top_k: int = 5) -> list[dict]:
-        """按自然语言查询相关代码块（文件/类/方法）"""
+        """混合检索：BM25 关键词召回 + 余弦向量召回，RRF 按排名倒数融合"""
         chunks = self.storage.load_chunks(repo)
         if not chunks:
             return []
-        q_vec = embed(query)
-        scored = []
-        for c in chunks:
-            if not c.get("vector"):
-                continue
-            sim = cosine(q_vec, c["vector"])
-            if sim > 0.01:
-                scored.append((sim, c))
-        scored.sort(key=lambda x: -x[0])
-        for _, c in scored[:top_k]:
-            c["score"] = round(_, 4)
-        return [c for _, c in scored[:top_k]]
+        texts = [
+            f"{c.get('name', '')}\n{c.get('doc', '')}\n{c.get('code', '')}"
+            for c in chunks
+        ]
+        q_vec = self._embed_one(query)
+        bm25 = BM25(texts)
+        bm_scores = bm25.score(query)
+        cos_scores = [
+            cosine(q_vec, c.get("vector") or []) if c.get("vector") else 0.0
+            for c in chunks
+        ]
+
+        # RRF：多路召回按排名倒数融合（k=60）
+        rrf: dict[int, float] = {}
+        for scores in (bm_scores, cos_scores):
+            order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+            for rank, i in enumerate(order):
+                if scores[i] > 0:
+                    rrf[i] = rrf.get(i, 0.0) + 1.0 / (60 + rank + 1)
+
+        top = sorted(rrf.items(), key=lambda x: -x[1])[:top_k]
+        results = []
+        for i, rrf_score in top:
+            c = dict(chunks[i])
+            c["score"] = round(rrf_score, 4)
+            c["bm25"] = round(bm_scores[i], 4)
+            c["cosine"] = round(cos_scores[i], 4)
+            results.append(c)
+        return results
 
     # ----------------------------------------------------------
     # 调用链查询

@@ -135,8 +135,24 @@ def _memory_report(memory) -> str:
     return "\n".join(lines)
 
 
-def _code_repo_command(args: str) -> str:
-    """处理 /code_repo 子命令：add / list / index / search"""
+def _remember_repo_index(memory, name: str, chunks: int | None = None):
+    """把仓库索引状态写入长期记忆（替换旧的同仓库条目），让 LLM 优先用 search_code 检索代码"""
+    marker = f"代码仓库 {name}"
+    for item in memory.list_long_term():
+        if item.content.startswith("项目信息：") and marker in item.content:
+            memory.delete_long_term(item.id)
+    if chunks is None:
+        fact = f"项目信息：代码仓库 {name} 已配置，查询该仓库代码请使用 search_code 工具"
+    else:
+        fact = (
+            f"项目信息：代码仓库 {name} 已建立索引（{chunks} 个代码块），"
+            "查询该仓库代码请直接使用 search_code 工具检索"
+        )
+    memory.store_fact(fact, source="coderag")
+
+
+def _repos_command(args: str, memory=None) -> str:
+    """处理 /repos 子命令：add / list / index / update / search"""
     from minimate.coderag import CodeRAGManager
 
     parts = (args or "").split()
@@ -145,7 +161,7 @@ def _code_repo_command(args: str) -> str:
     if not parts or parts[0] == "list":
         repos = mgr.list_repos()
         if not repos:
-            return "未配置代码仓库。用法：/code_repo add <名称> <路径|URL>"
+            return "未配置代码仓库。用法：/repos add <名称> <路径|URL>"
         return "已配置代码仓库：\n" + "\n".join(
             f"  - {k}: {v}" for k, v in repos.items()
         )
@@ -154,7 +170,9 @@ def _code_repo_command(args: str) -> str:
     if action == "add" and len(parts) >= 3:
         name, source = parts[1], parts[2]
         mgr.add_repo(name, source)
-        return f"已配置仓库 {name} -> {source}\n请执行 /code_repo index {name} 构建索引"
+        if memory:
+            _remember_repo_index(memory, name)
+        return f"已配置仓库 {name} -> {source}\n请执行 /repos index {name} 构建索引"
 
     if action == "index" and len(parts) >= 2:
         name = parts[1]
@@ -162,8 +180,23 @@ def _code_repo_command(args: str) -> str:
             info = mgr.index(name)
         except Exception as e:
             return f"[索引失败] {e}"
+        if memory:
+            _remember_repo_index(memory, name, chunks=info["chunks"])
         return (
             f"索引完成：{info['chunks']} 个代码块，{info['relations']} 条关系\n"
+            f"DB: {info['db']}"
+        )
+
+    if action == "update" and len(parts) >= 2:
+        name = parts[1]
+        try:
+            info = mgr.update(name)
+        except Exception as e:
+            return f"[更新失败] {e}"
+        if memory:
+            _remember_repo_index(memory, name, chunks=info["chunks"])
+        return (
+            f"更新完成：{info['chunks']} 个代码块，{info['relations']} 条关系\n"
             f"DB: {info['db']}"
         )
 
@@ -185,10 +218,11 @@ def _code_repo_command(args: str) -> str:
 
     return (
         "用法：\n"
-        "  /code_repo add <名称> <路径|URL>    配置代码仓库\n"
-        "  /code_repo list                    列出已配置仓库\n"
-        "  /code_repo index <名称>            构建 AST 索引\n"
-        "  /code_repo search <名称> <查询>    自然语言检索代码"
+        "  /repos add <名称> <路径|URL>    配置代码仓库\n"
+        "  /repos list                    列出已配置仓库\n"
+        "  /repos index <名称>            构建 AST 索引\n"
+        "  /repos update <名称>           拉取更新并重建索引（git 仓库先 pull）\n"
+        "  /repos search <名称> <查询>    自然语言检索代码"
     )
 
 
@@ -209,7 +243,7 @@ HELP_TEXT = """
   /mode <chat|react|plan>   切换执行模式
   /mcp                      查看 MCP 服务器连接状态
   /stats                    查看 LLM Token 用量统计
-  /code_repo                配置/索引/检索代码仓库（Code RAG）
+  /repos                    配置/索引/更新/检索代码仓库（Code RAG）
   /memory                   查看当前会话记忆（短期）
   /clear                    清空会话记忆
   /help                     显示本帮助
@@ -418,8 +452,8 @@ def interactive(kb_path: str = "", max_steps: int = 8):
             print(color.cyan(_mcp_status_report()))
         elif cmd == "/stats":
             print(color.cyan(_stats_report()))
-        elif cmd == "/code_repo":
-            print(color.cyan(_code_repo_command(arg)))
+        elif cmd == "/repos":
+            print(color.cyan(_repos_command(arg, memory)))
         elif cmd == "/memory":
             if arg.startswith("del "):
                 entry_id = arg.split(maxsplit=1)[1].strip()

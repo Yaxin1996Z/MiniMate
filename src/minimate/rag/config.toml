@@ -1,6 +1,6 @@
 [rag]
 # embedding 模型路径（本地已下载）
-embed_model_path = "C:\\Users\\ZhangYaxin\\.cache\\modelscope\\hub\\models\\BAAI\\bge-small-zh-v1___5"
+embed_model_path = "D:/Documents/Models/Embedding/bge-small-zh-v1.5"
 
 # 知识库文档目录（相对于 rag/ 目录）
 repo_dir = "repo"
