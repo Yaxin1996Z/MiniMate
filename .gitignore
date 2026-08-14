@@ -13,6 +13,7 @@ config.json
 # 输出报告
 output/
 reports/
+eval/results/
 
 # Chroma 向量库（自动生成）
 src/minimate/rag/rag_db/

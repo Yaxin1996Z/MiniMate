@@ -9,6 +9,7 @@ MiniMate CLI —— 工作/代码助手，支持三种 Agent 模式
   minimate "问题" --mode multi        # Multi-Agent（规划者/执行者/检查者协作）
   minimate "问题" --kb-path ./docs    # 加载自定义知识库
   minimate --rebuild                  # 重建知识库索引
+  minimate --eval basic               # 运行 Agent 评测并输出报告
   minimate                            # 交互模式（多轮对话，短期记忆）
 """
 
@@ -603,6 +604,25 @@ def cli():
     parser.add_argument("--kb-path", default="", help="知识库文档目录路径")
     parser.add_argument("--max-steps", type=int, default=8, help="ReAct 最大循环步数")
     parser.add_argument("--rebuild", action="store_true", help="强制重建知识库索引")
+    parser.add_argument(
+        "--eval",
+        nargs="?",
+        const="basic",
+        metavar="SUITE",
+        default=None,
+        help="运行 Agent 评测（默认 basic）并输出逐条报告",
+    )
+    parser.add_argument(
+        "--eval-modes",
+        default="",
+        help="只评测指定模式，逗号分隔（如 react,multi），默认全部",
+    )
+    parser.add_argument(
+        "--eval-max",
+        type=int,
+        default=0,
+        help="最多运行的评测用例数（快速验证用）",
+    )
     parser.add_argument("--version", "-v", action="store_true", help="显示版本")
     parser.add_argument("--verbose", action="store_true", help="开启控制台日志（默认仅写入文件）")
 
@@ -623,6 +643,23 @@ def cli():
         kb = get_knowledge_base(repo_dir=args.kb_path)
         kb.rebuild()
         print(f"  知识库已重建，共 {kb.count()} 个片段")
+        return
+
+    if args.eval:
+        from minimate.eval import EvalRunner
+
+        modes = {m.strip() for m in args.eval_modes.split(",") if m.strip()} or None
+        runner = EvalRunner(mode_filter=modes, max_cases=args.eval_max or None)
+        results, summary, paths = runner.run_suite(args.eval)
+        print(
+            f"\n评测完成：{summary.passed}/{summary.total} 通过"
+            f"（通过率 {summary.pass_rate * 100:.1f}%）"
+        )
+        print(
+            f"Token 总消耗：{summary.total_tokens}，"
+            f"平均 {summary.avg_tokens:.0f}/用例，耗时 {summary.total_duration:.0f}s"
+        )
+        print(f"报告：{paths['markdown']}")
         return
 
     if not args.question:

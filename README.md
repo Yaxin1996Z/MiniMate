@@ -245,6 +245,32 @@ cp config.example.json config.json
 
 ---
 
+## Agent 评测
+
+内置可复现的评测体系，用于量化 Agent 在四种模式下的任务完成能力，面试与简历数据均出自真实运行报告。
+
+```bash
+# 运行全部评测（16 条用例，覆盖 chat / react / plan / multi）
+minimate --eval basic
+
+# 只评测指定模式（快速验证）
+minimate --eval basic --eval-modes react,multi
+
+# 只跑前 N 条（验证链路用）
+minimate --eval basic --eval-max 2
+```
+
+运行后生成报告（Markdown + JSON）到 `eval/results/<时间戳>/`，逐条展示通过/失败、判定理由、耗时与 Token 消耗。
+
+**设计要点（保证评测可信）：**
+
+- **确定性断言 checker**：判定基于文件存在 / 内容包含 / 数值比对 / 命令退出码，不使用 LLM 自评，结果可复现
+- **沙箱隔离**：每条用例在独立临时目录执行，工具只能操作沙箱内文件，互不影响
+- **本地确定性任务**：评测集不依赖网络，覆盖四模式（问答 / 工具调用 / 计划执行 / 多 Agent 协作）
+- **成本可观测**：报告记录每条用例的耗时与 Token 消耗，便于评估优化效果
+
+---
+
 ## 项目结构
 
 ```
@@ -342,6 +368,7 @@ MiniMate/
 - [x] RAG 知识库（Chroma + bge 本地模型）
 - [x] Code RAG 代码仓库检索（AST 索引 + BM25 + bge-m3 向量混合检索）
 - [x] 长期记忆持久化（SQLite + 去重 + 关键词检索）
+- [x] Agent 评测体系（确定性 checker + 沙箱隔离 + 逐条报告）
 - [ ] Skill 技能包系统
 - [ ] 长期记忆向量检索
 
