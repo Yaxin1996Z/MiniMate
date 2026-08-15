@@ -7,7 +7,7 @@ from .core import ToolExecutor, _first_line, tool
 def query_knowledge(question: str) -> str:
     """从已加载的本地知识库中检索相关内容"""
     question = _first_line(question)
-    from ..rag import get_knowledge_base
+    from ..knowledgerag import get_knowledge_base
     kb = get_knowledge_base()
     return kb.query(question) or "知识库中没有相关内容。"
 

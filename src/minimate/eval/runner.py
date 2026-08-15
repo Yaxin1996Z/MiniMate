@@ -21,7 +21,7 @@ from ..tools import ToolExecutor, register_all_tools
 from .case import EvalCase, EvalCaseResult, EvalSummary
 from .checkers import run_checker
 from .report import render_json, render_markdown
-from .suites import get_suite
+from .suites_ai import get_suite
 
 
 class EvalRunner:
@@ -34,11 +34,13 @@ class EvalRunner:
     def __init__(
         self,
         mode_filter: Optional[set[str]] = None,
+        case_ids: Optional[set[str]] = None,
         max_cases: Optional[int] = None,
         max_steps: int = 8,
         results_dir: str = "",
     ):
         self.mode_filter = mode_filter
+        self.case_ids = case_ids
         self.max_cases = max_cases
         self.max_steps = max_steps
         self.results_dir = os.path.abspath(
@@ -57,9 +59,11 @@ class EvalRunner:
 
     def run_suite(self, suite: str = "basic") -> tuple[list[EvalCaseResult], EvalSummary, dict]:
         """运行整个评测集，返回 (逐条结果, 汇总统计, 报告文件路径)"""
-        cases = get_suite(suite)
+        cases = self._load_suite(suite)
         if self.mode_filter:
             cases = [c for c in cases if c.mode in self.mode_filter]
+        if self.case_ids:
+            cases = [c for c in cases if c.id in self.case_ids]
         if self.max_cases is not None and self.max_cases > 0:
             cases = cases[: self.max_cases]
 
@@ -67,6 +71,15 @@ class EvalRunner:
         summary = self._summarize(results)
         paths = self._save_report(suite, results, summary)
         return results, summary, paths
+
+    @staticmethod
+    def _load_suite(suite: str) -> list[EvalCase]:
+        """按套件名加载用例：basic/ai 为 AI 生成用例，real 为真实用户用例"""
+        if suite == "real":
+            from .suites_real import get_suite as _get_suite
+        else:
+            from .suites_ai import get_suite as _get_suite
+        return _get_suite(suite)
 
     # ----------------------------------------------------------
     # 单条用例

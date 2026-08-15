@@ -13,7 +13,8 @@ except Exception:
 
 from minimate.eval import EvalCase, EvalRunner
 from minimate.eval.checkers import run_checker
-from minimate.eval.suites import get_suite, list_suites
+from minimate.eval.suites_ai import get_suite, list_suites
+from minimate.eval.suites_real import REAL_SUITE, get_suite as get_real_suite, list_suites as list_real_suites
 
 
 class CheckerTest(unittest.TestCase):
@@ -95,6 +96,32 @@ class SuiteTest(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
 
 
+class RealSuiteTest(unittest.TestCase):
+    """真实用户用例集"""
+
+    def test_real_suite_structure(self):
+        self.assertIn("real", list_real_suites())
+        cases = get_real_suite("real")
+        self.assertEqual(len(cases), 1)
+        case = cases[0]
+        self.assertEqual(case.id, "real_multi_001")
+        self.assertEqual(case.mode, "multi")
+        self.assertEqual(case.checker, "command_exit0")
+        self.assertIn("结构", case.prompt)
+        self.assertIn("minimate.md", case.prompt)
+
+    def test_runner_loads_real_suite(self):
+        with tempfile.TemporaryDirectory(prefix="eval_out_") as out_dir:
+            with patch("minimate.eval.runner.Agent") as mock_agent_cls, patch(
+                "minimate.eval.runner.MultiAgentOrchestrator"
+            ) as mock_orch:
+                mock_orch.return_value.run.return_value = "已生成文档"
+                runner = EvalRunner(results_dir=out_dir)
+                results, summary, _ = runner.run_suite("real")
+            self.assertEqual(summary.total, 1)
+            self.assertEqual(results[0].case.id, "real_multi_001")
+
+
 class RunnerTest(unittest.TestCase):
     """运行器流程：沙箱隔离 + 判定 + 统计 + 报告"""
 
@@ -136,6 +163,21 @@ class RunnerTest(unittest.TestCase):
                 results, summary, _ = runner.run_suite("basic")
             self.assertEqual(summary.total, 2)
             self.assertTrue(all(r.case.mode == "chat" for r in results))
+
+    def test_case_id_filter(self):
+        """case_ids 只运行指定用例"""
+        with tempfile.TemporaryDirectory(prefix="eval_out_") as out_dir:
+            with patch("minimate.eval.runner.Agent") as mock_agent_cls:
+                mock_agent_cls.return_value.run.return_value = "x"
+                runner = EvalRunner(
+                    case_ids={"react_006", "multi_002"},
+                    results_dir=out_dir,
+                )
+                results, summary, _ = runner.run_suite("basic")
+            self.assertEqual(summary.total, 2)
+            self.assertEqual(
+                {r.case.id for r in results}, {"react_006", "multi_002"}
+            )
 
     def test_setup_writes_files(self):
         """setup 的内置 write 操作应真实落盘到沙箱"""

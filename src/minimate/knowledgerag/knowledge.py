@@ -1,7 +1,9 @@
 """
 知识库 —— 基于 Chroma + bge 本地 embedding 的 RAG 检索系统
 
-启动时自动加载 repo/ 下文档 → 分块 → embedding → 存入 Chroma（持久化）。
+启动时自动加载 ~/.minimate/knowledge/docs/ 下文档 → 分块 → embedding →
+存入 Chroma（持久化到 ~/.minimate/knowledge/rag_db/），与 Code RAG
+（~/.minimate/rag/、~/.minimate/repos/）路径平行。
 运行时只做检索，不写库。Chroma 数据落盘到 rag_db/，重复启动直接复用。
 """
 
@@ -56,10 +58,13 @@ class KnowledgeBase:
         self._initialized = True
 
         cfg = _load_config()
-        self._repo_dir = repo_dir or os.path.join(
-            os.path.dirname(__file__), cfg["repo_dir"]
+        # 知识库根目录：默认 ~/.minimate/knowledge，可用 MINIMATE_KNOWLEDGE_DIR 覆盖
+        knowledge_dir = os.getenv(
+            "MINIMATE_KNOWLEDGE_DIR",
+            os.path.join(os.path.expanduser("~"), ".minimate", "knowledge"),
         )
-        db_dir = os.path.join(os.path.dirname(__file__), cfg["db_dir"])
+        self._repo_dir = repo_dir or os.path.join(knowledge_dir, cfg["repo_dir"])
+        db_dir = os.path.join(knowledge_dir, cfg["db_dir"])
         embed_path = cfg["embed_model_path"]
 
         # 环境变量可覆盖模型路径（便于切换模型 / 容器挂载）

@@ -15,9 +15,6 @@ output/
 reports/
 eval/results/
 
-# Chroma 向量库（自动生成）
-src/minimate/rag/rag_db/
-
 # 日志
 logs/
 

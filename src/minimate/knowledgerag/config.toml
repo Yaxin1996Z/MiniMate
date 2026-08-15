@@ -1,0 +1,9 @@
+[rag]
+# embedding 模型路径（本地已下载）
+embed_model_path = "D:/Documents/Models/Embedding/bge-small-zh-v1.5"
+
+# 知识库文档目录（相对于 ~/.minimate/knowledge/，根目录可用 MINIMATE_KNOWLEDGE_DIR 覆盖）
+repo_dir = "docs"
+
+# Chroma 持久化目录（相对于 ~/.minimate/knowledge/）
+db_dir = "rag_db"

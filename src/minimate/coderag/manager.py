@@ -11,8 +11,12 @@ from .storage import SQLiteCodeStorage
 from .retriever import CodeRetriever
 
 
-DEFAULT_RAG_DIR = os.path.join(os.path.expanduser("~"), ".minimate", "rag")
-DEFAULT_REPOS_DIR = os.path.join(os.path.expanduser("~"), ".minimate", "repos")
+DEFAULT_RAG_DIR = os.path.join(
+    os.path.expanduser("~"), ".minimate", "coderepos", "rag_db"
+)
+DEFAULT_REPOS_DIR = os.path.join(
+    os.path.expanduser("~"), ".minimate", "coderepos", "repos"
+)
 
 
 def safe_repo_name(source: str) -> str:
@@ -38,7 +42,8 @@ class CodeRAGManager:
         self._provider = provider or get_provider()
         os.makedirs(rag_dir, exist_ok=True)
         os.makedirs(repos_dir, exist_ok=True)
-        self._config_path = os.path.join(rag_dir, "repos.json")
+        # 仓库配置放 coderepos 根目录（与 rag_db 数据目录分离）
+        self._config_path = os.path.join(os.path.dirname(rag_dir), "repos.json")
         self._config: dict[str, str] = self._load_config()
 
     # ----------------------------------------------------------

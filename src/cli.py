@@ -35,7 +35,7 @@ from minimate import __version__
 from minimate.tools import Tool, ToolExecutor, register_all_tools
 from minimate.memory import MemoryManager
 from minimate.agent import Agent, MultiAgentOrchestrator
-from minimate.rag import get_knowledge_base
+from minimate.knowledgerag import get_knowledge_base
 from minimate.colors import color
 from minimate.config import get_mcp_servers
 from minimate.mcp import McpToolAdapter
@@ -618,10 +618,31 @@ def cli():
         help="只评测指定模式，逗号分隔（如 react,multi），默认全部",
     )
     parser.add_argument(
+        "--eval-id",
+        default="",
+        help="只评测指定用例 id，逗号分隔可多个（如 react_006,chat_001）",
+    )
+    parser.add_argument(
         "--eval-max",
         type=int,
         default=0,
         help="最多运行的评测用例数（快速验证用）",
+    )
+    parser.add_argument(
+        "--swebench-download",
+        action="store_true",
+        help="下载 SWE-bench Multilingual 数据集清单（300 条）到 ~/.minimate/eval",
+    )
+    parser.add_argument(
+        "--swebench-gold",
+        action="store_true",
+        help="SWE-bench 自检模式：应用官方修复补丁验证判定器（不调用 LLM）",
+    )
+    parser.add_argument(
+        "--swebench-agent-mode",
+        choices=["react", "multi"],
+        default="react",
+        help="SWE-bench 修复使用的 Agent 模式（默认 react）",
     )
     parser.add_argument("--version", "-v", action="store_true", help="显示版本")
     parser.add_argument("--verbose", action="store_true", help="开启控制台日志（默认仅写入文件）")
@@ -639,17 +660,53 @@ def cli():
         return
 
     if args.rebuild:
-        from minimate.rag import get_knowledge_base
+        from minimate.knowledgerag import get_knowledge_base
         kb = get_knowledge_base(repo_dir=args.kb_path)
         kb.rebuild()
         print(f"  知识库已重建，共 {kb.count()} 个片段")
+        return
+
+    if args.swebench_download:
+        from minimate.eval.suites_swebench import download_swebench_data
+
+        n = download_swebench_data()
+        print(
+            f"已下载 {n} 条 SWE-bench Multilingual 实例到 "
+            r"~/.minimate/eval/swebench_multilingual.jsonl"
+        )
+        return
+
+    if args.eval == "swebench":
+        from minimate.eval.suites_swebench import SWEBenchRunner
+
+        case_ids = [c.strip() for c in args.eval_id.split(",") if c.strip()] or None
+        runner = SWEBenchRunner(
+            agent_mode=args.swebench_agent_mode,
+            max_steps=args.max_steps,
+            gold_check=args.swebench_gold,
+        )
+        results, summary, paths = runner.run_suite(
+            case_ids=case_ids,
+            max_cases=args.eval_max or 1,
+        )
+        rate = (
+            summary["passed"] / summary["total"] * 100 if summary["total"] else 0
+        )
+        print(f"\nSWE-bench 评测完成：{summary['passed']}/{summary['total']} 修复成功（{rate:.1f}%）")
+        print(f"总耗时 {summary['total_duration']:.0f}s，Token {summary['total_tokens']}")
+        print(f"报告：{paths['markdown']}")
         return
 
     if args.eval:
         from minimate.eval import EvalRunner
 
         modes = {m.strip() for m in args.eval_modes.split(",") if m.strip()} or None
-        runner = EvalRunner(mode_filter=modes, max_cases=args.eval_max or None)
+        case_ids = {c.strip() for c in args.eval_id.split(",") if c.strip()} or None
+        runner = EvalRunner(
+            mode_filter=modes,
+            case_ids=case_ids,
+            max_cases=args.eval_max or None,
+        )
         results, summary, paths = runner.run_suite(args.eval)
         print(
             f"\n评测完成：{summary.passed}/{summary.total} 通过"

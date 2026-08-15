@@ -11,7 +11,7 @@
 
 from .case import EvalCase, EvalCaseResult, EvalSummary
 from .checkers import run_checker
-from .suites import get_suite, list_suites
+from .suites_ai import get_suite, list_suites
 from .runner import EvalRunner
 from .report import render_markdown, render_json
 
