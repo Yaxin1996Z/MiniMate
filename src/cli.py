@@ -41,6 +41,8 @@ from minimate.config import get_mcp_servers
 from minimate.mcp import McpToolAdapter
 from minimate.logging import log_path
 from minimate.coderag import search_code
+from minimate.hitl import TerminalHitlHandler
+from minimate.tools.hitl_executor import HitlToolExecutor
 
 
 # 保持 MCP 连接引用，防止被 GC 回收
@@ -281,6 +283,7 @@ HELP_TEXT = """
   /mcp                      查看 MCP 服务器连接状态
   /stats                    查看 LLM Token 用量统计
   /repos                    配置/索引/更新/检索代码仓库（Code RAG）
+  /hitl <on|off>            启用/关闭人工审批（HITL，默认关闭）
   /memory                   查看当前会话记忆（短期）
   /clear                    清空会话记忆
   /help                     显示本帮助
@@ -298,10 +301,13 @@ def build_agent(
     memory: MemoryManager,
     kb_path: str = "",
     max_steps: int = 8,
+    hitl_handler: TerminalHitlHandler | None = None,
 ) -> Agent:
     """装配工具并创建 Agent（单次执行与交互模式共用）"""
 
-    tools = ToolExecutor()
+    tools: ToolExecutor = (
+        HitlToolExecutor(hitl_handler) if hitl_handler else ToolExecutor()
+    )
     # 注册全部内置工具（按类分组：文件/Shell/Web/RAG，见 tools/registry.py）
     register_all_tools(tools)
     # Code RAG 检索工具（配置了代码仓库后可用）
@@ -368,12 +374,14 @@ def run_query(
     mode: str = "react",
     kb_path: str = "",
     max_steps: int = 8,
+    hitl: bool = False,
 ) -> str:
     """以指定模式执行一次任务，返回最终答案"""
 
     memory = _memory_with_repos()
     memory.add_user_message(question)
-    agent = build_agent(memory, kb_path, max_steps)
+    hitl_handler = TerminalHitlHandler(enabled=hitl) if hitl else None
+    agent = build_agent(memory, kb_path, max_steps, hitl_handler)
 
     print(color.cyan(f"\n{'=' * 60}"))
     print(color.cyan(f"  MiniMate v{__version__}  [{mode} 模式]", bold=True))
@@ -496,7 +504,8 @@ def interactive(kb_path: str = "", max_steps: int = 8):
     print(f"  输入 /help 查看命令，Ctrl+C 退出")
 
     memory = _memory_with_repos()
-    agent = build_agent(memory, kb_path, max_steps)
+    hitl_handler = TerminalHitlHandler(enabled=False)  # HITL 默认关闭，/hitl on 开启
+    agent = build_agent(memory, kb_path, max_steps, hitl_handler)
     mode = "react"
     history: list[str] = []
     print(color.green(f"\n  当前模式：{mode}", bold=True) + "（可用 /mode chat|plan|multi 切换）")
@@ -523,6 +532,16 @@ def interactive(kb_path: str = "", max_steps: int = 8):
             print(color.cyan(_stats_report()))
         elif cmd == "/repos":
             print(color.cyan(_repos_command(arg, memory)))
+        elif cmd == "/hitl":
+            if arg == "on":
+                hitl_handler.set_enabled(True)
+                print(color.green("  已启用 HITL 人工审批（危险操作将请求确认）"))
+            elif arg == "off":
+                hitl_handler.set_enabled(False)
+                print(color.green("  已关闭 HITL 人工审批"))
+            else:
+                state = "开启" if hitl_handler.is_enabled() else "关闭"
+                print(color.yellow(f"  HITL 人工审批当前状态：{state}（/hitl on|off 切换）"))
         elif cmd == "/memory":
             if arg.startswith("del "):
                 entry_id = arg.split(maxsplit=1)[1].strip()
@@ -534,6 +553,7 @@ def interactive(kb_path: str = "", max_steps: int = 8):
                 print(color.yellow(_memory_report(memory)))
         elif cmd == "/clear":
             memory.clear()
+            hitl_handler.clear_approved_all()
             print(color.green("  会话记忆已清空"))
         else:
             print(color.red(f"  未知命令：{cmd}（输入 /help 查看帮助）"))
@@ -646,6 +666,11 @@ def cli():
     )
     parser.add_argument("--version", "-v", action="store_true", help="显示版本")
     parser.add_argument("--verbose", action="store_true", help="开启控制台日志（默认仅写入文件）")
+    parser.add_argument(
+        "--hitl",
+        action="store_true",
+        help="启用 HITL 人工审批（危险工具调用前请求确认，默认关闭）",
+    )
 
     args = parser.parse_args()
 
@@ -728,6 +753,7 @@ def cli():
         mode=args.mode,
         kb_path=args.kb_path,
         max_steps=args.max_steps,
+        hitl=args.hitl,
     )
     print(f"\n{_stats_report()}")
 
