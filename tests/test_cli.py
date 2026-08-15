@@ -7,7 +7,17 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from cli import _display_width, _input_windows, _repos_command, interactive
+from cli import (
+    _display_width,
+    _input_windows,
+    _load_mcp_tools,
+    _maybe_load_lazy_mcp,
+    _repos_command,
+    interactive,
+)
+from minimate.tools import ToolExecutor
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 from minimate.memory import MemoryManager
 
 
@@ -161,6 +171,81 @@ class ReposCommandTest(unittest.TestCase):
         ]
         self.assertEqual(len(facts), 1)
         self.assertIn("10 个代码块", facts[0].content)
+
+
+class McpLazyLoadTest(unittest.TestCase):
+    """MCP 按需加载：lazy 服务器启动不连接，命中关键词才加载"""
+
+    def _fake_adapter(self, name, lazy=False, keywords=None, status="pending"):
+        a = SimpleNamespace(
+            server_name=name,
+            transport="http",
+            lazy=lazy,
+            keywords=keywords or [],
+            status=status,
+        )
+        a.connect = MagicMock(return_value=[])
+        return a
+
+    def test_lazy_not_loaded_without_keyword(self):
+        tools = ToolExecutor()
+        adapter = self._fake_adapter("notion", lazy=True, keywords=["notion", "笔记"])
+        with patch("cli._mcp_adapters", [adapter]):
+            ok = _maybe_load_lazy_mcp(tools, "帮我写一个排序函数")
+        self.assertFalse(ok)
+        adapter.connect.assert_not_called()
+
+    def test_keyword_triggers_lazy_load(self):
+        tools = ToolExecutor()
+        adapter = self._fake_adapter("notion", lazy=True, keywords=["notion", "笔记"])
+        with patch("cli._mcp_adapters", [adapter]):
+            ok = _maybe_load_lazy_mcp(tools, "把这篇笔记同步到 notion 数据库")
+        self.assertTrue(ok)
+        adapter.connect.assert_called_once()
+
+    def test_loaded_lazy_skipped(self):
+        tools = ToolExecutor()
+        adapter = self._fake_adapter(
+            "notion", lazy=True, keywords=["notion"], status="connected"
+        )
+        with patch("cli._mcp_adapters", [adapter]):
+            ok = _maybe_load_lazy_mcp(tools, "notion")
+        self.assertFalse(ok)
+        adapter.connect.assert_not_called()
+
+    def test_load_mcp_skips_lazy_on_start(self):
+        """启动时只连接非 lazy 服务器"""
+        cfg = [
+            {"name": "demo", "transport": "stdio", "command": "uv", "args": [], "env": {}},
+            {
+                "name": "notion",
+                "transport": "http",
+                "url": "https://mcp.notion.com/mcp",
+                "lazy": True,
+                "keywords": ["notion"],
+            },
+        ]
+        adapters = []
+
+        def factory(**kwargs):
+            a = self._fake_adapter(
+                kwargs["server_name"],
+                lazy=kwargs.get("lazy", False),
+                keywords=kwargs.get("keywords", []),
+            )
+            adapters.append(a)
+            return a
+
+        tools = ToolExecutor()
+        with patch("cli.get_mcp_servers", return_value=cfg), patch(
+            "cli.McpToolAdapter", side_effect=factory
+        ), patch("cli._mcp_adapters", []):
+            _load_mcp_tools(tools)
+
+        demo = next(a for a in adapters if a.server_name == "demo")
+        notion = next(a for a in adapters if a.server_name == "notion")
+        demo.connect.assert_called_once()
+        notion.connect.assert_not_called()
 
 
 if __name__ == "__main__":

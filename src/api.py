@@ -25,7 +25,7 @@ from cli import run_query
 
 app = FastAPI(
     title="MiniMate API",
-    description="工作/代码助手 Agent 服务 - 支持 chat / react / plan 三种模式",
+    description="工作/代码助手 Agent 服务 - 支持 chat / react / plan / multi 四种模式",
     version=__version__,
 )
 
@@ -36,7 +36,7 @@ app = FastAPI(
 
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, description="任务/问题")
-    mode: str = Field("react", description="执行模式：chat / react / plan")
+    mode: str = Field("react", description="执行模式：chat / react / plan / multi")
     kb_path: Optional[str] = Field("", description="知识库文档目录路径（可选）")
     max_steps: int = Field(8, ge=1, le=30, description="ReAct 最大循环步数")
 

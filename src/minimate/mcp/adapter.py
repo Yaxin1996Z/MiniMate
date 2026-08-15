@@ -45,9 +45,13 @@ class McpToolAdapter:
         url: str | None = None,
         headers: dict | None = None,
         oauth: dict | None = None,
+        lazy: bool = False,
+        keywords: list[str] | None = None,
     ):
         self.server_name = server_name
         self.transport = transport
+        self.lazy = lazy            # 按需加载：启动时不连接，命中关键词才加载
+        self.keywords = list(keywords or [])
         self.config = {
             "command": command,
             "args": args or [],

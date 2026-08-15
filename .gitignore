@@ -21,6 +21,9 @@ logs/
 # 本地缓存（OAuth token 等）
 .cache/
 
+# Docker 容器数据目录（运行时生成，与宿主机隔离）
+docker_data/
+
 # 旧版 Chroma（清理前残留）
 chroma_db/
 

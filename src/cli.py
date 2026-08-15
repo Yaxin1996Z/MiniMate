@@ -50,7 +50,7 @@ _mcp_adapters: list[McpToolAdapter] = []
 
 
 def _load_mcp_tools(tools: ToolExecutor):
-    """从 config.json 读取 MCP 配置，加载远程工具到执行器"""
+    """从 config.json 读取 MCP 配置：非 lazy 服务器启动即加载，lazy 服务器按需加载"""
     global _mcp_adapters
     servers = get_mcp_servers()
     if not servers:
@@ -67,14 +67,47 @@ def _load_mcp_tools(tools: ToolExecutor):
                 url=server.get("url"),
                 headers=server.get("headers"),
                 oauth=server.get("oauth"),
+                lazy=bool(server.get("lazy", False)),
+                keywords=server.get("keywords", []),
             )
-            mcp_tools = adapter.connect()
-            for t in mcp_tools:
-                tools.register(t)
             _mcp_adapters.append(adapter)
-            print(f"  MCP 已加载：{name}（{len(mcp_tools)} 个工具）")
+            if adapter.lazy:
+                print(f"  MCP 待按需加载：{name}（关键词：{'、'.join(adapter.keywords) or '无'}）")
+                continue
+            _connect_and_register(adapter, tools)
         except Exception as e:
             print(f"  ⚠️ MCP 加载失败：{name} - {e}")
+
+
+def _connect_and_register(adapter: McpToolAdapter, tools: ToolExecutor) -> bool:
+    """连接 MCP 服务器并注册工具到执行器，成功返回 True"""
+    try:
+        mcp_tools = adapter.connect()
+        for t in mcp_tools:
+            tools.register(t)
+        print(f"  MCP 已加载：{adapter.server_name}（{len(mcp_tools)} 个工具）")
+        return True
+    except Exception as e:
+        print(f"  ⚠️ MCP 加载失败：{adapter.server_name} - {e}")
+        return False
+
+
+def _maybe_load_lazy_mcp(tools: ToolExecutor, text: str) -> bool:
+    """检测输入是否命中 lazy MCP 服务器的关键词，命中则按需加载对应工具组"""
+    if not text:
+        return False
+    lowered = text.lower()
+    loaded = False
+    for adapter in _mcp_adapters:
+        if not adapter.lazy or adapter.status != "pending":
+            continue
+        if any(kw.lower() in lowered for kw in adapter.keywords):
+            print(
+                f"  🔍 检测到关键词，按需加载 MCP：{adapter.server_name}"
+            )
+            if _connect_and_register(adapter, tools):
+                loaded = True
+    return loaded
 
 
 def _mcp_status_report() -> str:
@@ -90,6 +123,12 @@ def _mcp_status_report() -> str:
         "closed": "⏹",
     }
     for a in _mcp_adapters:
+        if a.lazy and a.status == "pending":
+            lines.append(
+                f"    ⏸ {a.server_name} [{a.transport}] 待按需加载"
+                f"（关键词：{'、'.join(a.keywords) or '无'}）"
+            )
+            continue
         icon = icons.get(a.status, "❓")
         base = f"    {icon} {a.server_name} [{a.transport}] {a.status}"
         if a.status == "connected":
@@ -382,6 +421,7 @@ def run_query(
     memory.add_user_message(question)
     hitl_handler = TerminalHitlHandler(enabled=hitl) if hitl else None
     agent = build_agent(memory, kb_path, max_steps, hitl_handler)
+    _maybe_load_lazy_mcp(agent.tools, question)
 
     print(color.cyan(f"\n{'=' * 60}"))
     print(color.cyan(f"  MiniMate v{__version__}  [{mode} 模式]", bold=True))
@@ -582,6 +622,8 @@ def interactive(kb_path: str = "", max_steps: int = 8):
                     break
                 continue
 
+            # 按需加载 MCP 工具组（如输入提到 Notion 关键词时）
+            _maybe_load_lazy_mcp(agent.tools, line)
             memory.add_user_message(line)
             answer = _run_agent_query(line, mode, agent, memory, max_steps)
             memory.add_ai_message(answer)
@@ -687,7 +729,9 @@ def cli():
     if args.rebuild:
         from minimate.knowledgerag import get_knowledge_base
         kb = get_knowledge_base(repo_dir=args.kb_path)
-        kb.rebuild()
+        if kb.count() > 0:
+            # 库已有数据：清空并强制重建；空库时 __init__ 已自动加载
+            kb.rebuild()
         print(f"  知识库已重建，共 {kb.count()} 个片段")
         return
 

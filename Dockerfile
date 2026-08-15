@@ -11,17 +11,15 @@ WORKDIR /app
 RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
     pip config set global.trusted-host mirrors.aliyun.com
 
-# 安装依赖
-COPY pyproject.toml .
-RUN pip install --no-cache-dir .
-
-# 拷贝应用代码（src layout：minimate 包 + cli/api 入口）
+# 先拷贝构建所需文件（pyproject + README + src），再安装，
+# 确保 minimate 包与 cli/api entry point 正确装进 site-packages
+COPY pyproject.toml README.md ./
 COPY src/ ./src/
 COPY run.py .
-COPY pyproject.toml .
+RUN pip install --no-cache-dir .
 
-# 创建输出目录和 RAG 目录
-RUN mkdir -p /app/output /app/src/minimate/rag/rag_db /app/src/minimate/rag/repo
+# 创建输出目录（知识库/模型目录由 compose 挂载，见 docker-compose.yml）
+RUN mkdir -p /app/output
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \

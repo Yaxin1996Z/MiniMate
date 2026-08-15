@@ -16,7 +16,9 @@
         "oauth": {
           "client_id": "YOUR_NOTION_OAUTH_CLIENT_ID",
           "scope": "openid offline_access"
-        }
+        },
+        "lazy": true,
+        "keywords": ["notion", "笔记", "数据库", "知识库"]
       }
     ]
   }
