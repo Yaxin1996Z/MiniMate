@@ -222,49 +222,96 @@ class JavaMavenAdapter:
         bnd-maven-plugin 3.x 依赖已移除的 JDK 内部 API，在 JDK 17+ 上会
         报 "Null query"；OSGi bundle 打包与单元测试无关，直接移除。
         """
+        # 删除 module-info.java：老测试代码可能引用未声明的模块（如 java.awt），
+        # 回退 classpath 编译模式避免 JPMS 隔离报错（单元测试判定不需要模块化）
+        for mod_info in glob.glob(
+            os.path.join(repo_dir, "**", "module-info.java"), recursive=True
+        ):
+            try:
+                os.remove(mod_info)
+            except OSError:
+                pass
         for pom in glob.glob(os.path.join(repo_dir, "**", "pom.xml"), recursive=True):
             try:
                 with open(pom, encoding="utf-8") as f:
                     text = f.read()
             except OSError:
                 continue
-            patched = re.sub(
+            # 移除 javac -Werror：老代码在 JDK 24 上常有 deprecation 等警告，
+            # -Werror 会把警告误判为编译失败（与测试判定无关）
+            modified = re.sub(r"<arg>\s*-Werror\s*</arg>", "", text)
+            modified = re.sub(
+                r"<compilerArgument>\s*-Werror\s*</compilerArgument>", "", modified
+            )
+            # maven-compiler-plugin 的 failOnWarning 同样会把警告当失败，关闭
+            modified = re.sub(
+                r"<failOnWarning>\s*true\s*</failOnWarning>",
+                "<failOnWarning>false</failOnWarning>",
+                modified,
+            )
+            modified = re.sub(
                 r"<plugin>\s*<groupId>biz\.aQute\.bnd</groupId>.*?</plugin>",
                 "",
-                text,
+                modified,
                 flags=re.S,
             )
-            if patched != text:
+            if modified != text:
                 with open(pom, "w", encoding="utf-8") as f:
-                    f.write(patched)
+                    f.write(modified)
 
     def run_tests(self, repo_dir: str, tests: list[str]) -> tuple[bool, str]:
-        """运行指定测试（mvn -pl gson test -Dtest=Class#m1+m2）"""
+        """运行指定测试：从 test_patch 动态推断测试模块，mvn -pl <模块> -am test"""
         if not tests:
             return True, "无测试需要运行"
         classes: dict[str, list[str]] = {}
         for t in tests:
-            cls, _, method = t.rpartition("#")
-            classes.setdefault(cls, []).append(method)
-        spec = ",".join(f"{c}#{'+'.join(ms)}" for c, ms in classes.items())
+            cls, sep, method = t.rpartition("#")
+            if sep:
+                classes.setdefault(cls, []).append(method)
+            else:
+                # 纯类名（F2P 只给类名时，如 NodeTest）
+                classes.setdefault(t, [])
+        # 纯类名（无方法）不加尾 #，避免 surefire 匹配失败
+        spec = ",".join(
+            f"{c}#{'+'.join(ms)}" if ms else c for c, ms in classes.items()
+        )
+        module = self._test_module()
         # 用 java 直接运行 Maven launcher，规避 Windows 下 .CMD 批处理参数传递问题
         java, maven_home = self._maven_java()
         boot = sorted(glob.glob(os.path.join(maven_home, "boot", "plexus-classworlds-*.jar")))
         if not boot:
             return False, f"未找到 plexus-classworlds.jar（Maven home: {maven_home}）"
         cmd = [
-            java, "-classpath", boot[-1],
+            java,
+            # Windows 上 JVM 默认 file.encoding=GBK，导致内嵌 javac 按 GBK 读
+            # UTF-8 源码产生编码警告（-Werror 误判失败），强制 UTF-8
+            "-Dfile.encoding=UTF-8",
+            "-classpath", boot[-1],
             f"-Dclassworlds.conf={os.path.join(maven_home, 'bin', 'm2.conf')}",
             f"-Dmaven.home={maven_home}",
             f"-Dmaven.multiModuleProjectDirectory={repo_dir}",
             "org.codehaus.plexus.classworlds.launcher.Launcher",
-            "-q", "-pl", "gson", "-am",
+            "-q", "-pl", module, "-am",
             "test",
             f"-Dtest={spec}",
             "-DfailIfNoTests=false",
-            "-Dmaven.compiler.source=11",
-            "-Dmaven.compiler.target=11",
+            # 多模块仓库：-am 构建的依赖模块可能没有指定测试，忽略而非报错
+            "-Dsurefire.failIfNoSpecifiedTests=false",
+            # 老版本 JaCoCo 解析不了新版 JDK 编译的 class，覆盖率与判定无关，跳过
+            "-Djacoco.skip=true",
+            # 老版本 ProGuard 不支持新版 JDK 的 class 版本，混淆与测试判定无关，跳过
+            "-Dproguard.skip=true",
+            # patch 应用后偶发编码警告，-Werror 会误判失败，关闭 warning 即失败
+            "-Dmaven.compiler.failOnWarning=false",
+            # Windows 上 javac 默认按平台编码（GBK）读 UTF-8 源码会报编码警告，
+            # 显式指定 UTF-8，避免 -Werror 误判
+            "-Dmaven.compiler.encoding=UTF-8",
+            # release=11 同时约束语法与 API 版本，避免老代码与 JDK 21+ 的
+            # SequencedCollection（List.addFirst/getFirst 等）方法冲突
+            "-Dmaven.compiler.release=11",
             "-Djava.version=11",
+            # 部分仓库的编译属性用驼峰 javaVersion（如 gson 2.9.1-SNAPSHOT）
+            "-DjavaVersion=11",
         ]
         try:
             proc = subprocess.run(
@@ -281,6 +328,15 @@ class JavaMavenAdapter:
         tail = self._extract_maven_result(proc.stdout or "") + "\n" + (proc.stderr or "")[-1000:]
         return proc.returncode == 0, f"退出码 {proc.returncode}\n{tail}"
 
+    def _test_module(self) -> str:
+        """从 test_patch 的 diff 路径推断测试所在的 Maven 模块（如 gson / javaparser-core-testing）"""
+        m = re.search(r"diff --git a/([^/]+)/src/test", self.case.test_patch or "")
+        if m:
+            return m.group(1)
+        # 兜底：gson 等单测试模块仓库
+        m2 = re.search(r"diff --git a/([^/]+)/test", self.case.test_patch or "")
+        return m2.group(1) if m2 else "."
+
     @staticmethod
     def _extract_maven_result(out: str) -> str:
         """提取 Maven 输出中的测试统计与失败详情（避免长输出淹没关键信息）"""
@@ -288,6 +344,7 @@ class JavaMavenAdapter:
         keep: list[str] = []
         keywords = (
             "Tests run:", "Failures:", "Errors:", "Skipped:",
+            "[ERROR]", "[WARNING]",
             "[ERROR] test", "FAILURE!", "BUILD SUCCESS", "BUILD FAILURE",
             "COMPILATION ERROR", "cannot find symbol", "expected:",
             "but was:", "No tests matching",
@@ -360,12 +417,12 @@ class SWEBenchRunner:
     def run_suite(
         self,
         case_ids: Optional[list[str]] = None,
-        max_cases: int = 1,
+        max_cases: Optional[int] = None,
     ) -> tuple[list[SWEBenchResult], dict, dict]:
         cases = load_swebench()
         if case_ids:
             cases = [c for c in cases if c.instance_id in case_ids]
-        if max_cases and max_cases > 0:
+        if max_cases is not None and max_cases > 0:
             cases = cases[:max_cases]
 
         results = [self.run_case(case) for case in cases]

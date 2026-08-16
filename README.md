@@ -317,7 +317,6 @@ MiniMate/
 │   └── mcp_demo_server.py        # 示例 MCP Server（FastMCP）
 │   └── mcp_http_server.py        # 示例远程 MCP Server（FastMCP HTTP）
 ├── docs/                         # 设计文档
-├── output/                       # 工具输出目录
 ├── config.example.json           # 配置模板（MCP servers）
 ├── Dockerfile
 ├── docker-compose.yml

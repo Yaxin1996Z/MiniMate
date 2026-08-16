@@ -26,6 +26,3 @@ docker_data/
 
 # 旧版 Chroma（清理前残留）
 chroma_db/
-
-# 旧版 research_agent 目录（MiniMate 迁移前的遗留，暂不纳入）
-research_agent/

@@ -756,7 +756,7 @@ def cli():
         )
         results, summary, paths = runner.run_suite(
             case_ids=case_ids,
-            max_cases=args.eval_max or 1,
+            max_cases=args.eval_max or None,
         )
         rate = (
             summary["passed"] / summary["total"] * 100 if summary["total"] else 0
